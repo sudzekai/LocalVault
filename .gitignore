@@ -1,0 +1,50 @@
+# Сборка CMake и результаты тестов
+/build*/
+/out/
+/dist/
+/app/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+build.ninja
+.ninja_*
+
+# Промежуточные файлы C++ и двоичные артефакты
+*.d
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# Генерируемые файлы Qt и локальные настройки IDE
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.moc
+.qmake.stash
+.qmake.cache
+*.user
+*.user.*
+.qtcreator/
+.vs/
+*.suo
+
+# Локальные хранилища и экспортированные копии
+*.lvault
+*.lvault.*
+*.lvault~
+vault.lock

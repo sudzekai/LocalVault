@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LocalVault
+Comment=Local password manager
+Comment[ru]=Локальный менеджер паролей
+Exec=LocalVault
+Icon=localvault
+Terminal=false
+Categories=Utility;Security;
