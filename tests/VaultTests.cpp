@@ -4,6 +4,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QTemporaryDir>
+#include <QtEndian>
 
 #include <iostream>
 #include <stdexcept>
@@ -136,6 +137,72 @@ void checkVault()
     check(rollback.data().entries.size() == 1 && rollback.data().entries[0].id == retainedId
           && rollback.data().idleMinutes == 5, "failed write changed in-memory state");
 }
+
+void checkOptionalEmail()
+{
+    QTemporaryDir dir;
+    check(dir.isValid(), "temporary directory for email");
+    const auto active = dir.filePath(QStringLiteral("email.lvault"));
+    const auto backup = dir.filePath(QStringLiteral("backup.lvault"));
+    const auto restoredPath = dir.filePath(QStringLiteral("restored.lvault"));
+    const auto master = QStringLiteral("master password for email");
+    const auto nextMaster = QStringLiteral("new master password for email");
+    const auto login = QStringLiteral("separate-login");
+    const auto email = QStringLiteral("optional+test@example.com");
+    StorageManager storage(active);
+    PasswordManager manager(active);
+    manager.create(master);
+    auto original = sample(login);
+    const auto id = original.id;
+    manager.put(std::move(original));
+    manager.put(sample(QStringLiteral("other-account")));
+    const auto version = [](const QByteArray &bytes) {
+        return qFromBigEndian<quint32>(bytes.constData() + 4);
+    };
+    check(version(storage.read()) == 1, "empty emails must use format 1");
+    manager.lock();
+    manager.open(master);
+    check(manager.data().entries[0].email.isEmpty(), "format 1 email must default to empty");
+
+    auto edited = sample(login);
+    edited.id = id;
+    edited.email = email;
+    manager.put(std::move(edited));
+    const auto upgraded = storage.read();
+    check(version(upgraded) == 2 && !upgraded.contains(email.toUtf8()), "email must use encrypted format 2");
+    manager.lock();
+    expectError(VaultError::WrongPassword, [&] { manager.open(nextMaster); });
+    manager.open(master);
+    check(manager.data().entries[0].id == id && manager.data().entries[0].login == login
+          && manager.data().entries[0].email == email && manager.data().entries[1].email.isEmpty(),
+          "format 2 round trip");
+
+    auto invalid = sample(login);
+    invalid.id = id;
+    invalid.email = QStringLiteral("missing-domain");
+    expectError(VaultError::Invalid, [&] { manager.put(std::move(invalid)); });
+    check(storage.read() == upgraded, "invalid email changed the file");
+
+    auto fakeFormat = upgraded;
+    fakeFormat[7] = char(1);
+    fakeFormat.chop(32);
+    fakeFormat += QCryptographicHash::hash(fakeFormat, QCryptographicHash::Sha256);
+    StorageManager(backup).write(fakeFormat);
+    expectError(VaultError::Damaged, [&] { manager.importFrom(backup, master); });
+
+    manager.exportTo(backup);
+    PasswordManager restored(restoredPath);
+    restored.importFrom(backup, master);
+    restored.changePassword(master, nextMaster);
+    restored.lock();
+    restored.open(nextMaster);
+    check(restored.data().entries[0].email == email, "backup or password rotation lost email");
+
+    auto cleared = sample(login);
+    cleared.id = id;
+    manager.put(std::move(cleared));
+    check(version(storage.read()) == 1, "removing the last email must restore format 1");
+}
 }
 
 int main(int argc, char *argv[])
@@ -144,6 +211,7 @@ int main(int argc, char *argv[])
     try {
         CryptoManager::initialize();
         checkVault();
+        checkOptionalEmail();
         checkGenerator();
         std::cout << "Vault checks passed\n";
     } catch (const Failure &failure) {

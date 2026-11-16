@@ -39,14 +39,20 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
     auto *site = add(QStringLiteral("Сайт"), new QLineEdit(&dialog));
     auto *url = add(QStringLiteral("Адрес"), new QLineEdit(&dialog));
     auto *login = add(QStringLiteral("Логин"), new QLineEdit(&dialog));
+    auto *email = add(readOnly ? QStringLiteral("Электронная почта")
+                               : QStringLiteral("Электронная почта (необязательно)"),
+                      new QLineEdit(&dialog));
     auto *password = add(QStringLiteral("Пароль"), secretField(&dialog));
-    const auto cleanup = qScopeGuard([&] { clearFields({site, url, login, password}); });
+    const auto cleanup = qScopeGuard([&] { clearFields({site, url, login, email, password}); });
     url->setPlaceholderText(QStringLiteral("https://example.com"));
+    if (!readOnly)
+        email->setPlaceholderText(QStringLiteral("name@example.com"));
     const QUuid id = entry ? entry->id : QUuid::createUuid();
     if (entry) {
         site->setText(entry->site);
         url->setText(entry->url);
         login->setText(entry->login);
+        email->setText(entry->email);
         password->setText(entry->password);
     }
     addReveal(layout, password);
@@ -89,6 +95,7 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
         edited.site = site->text().trimmed();
         edited.url = url->text().trimmed();
         edited.login = login->text();
+        edited.email = email->text().trimmed();
         edited.password = password->text();
         try {
             manager.put(std::move(edited));

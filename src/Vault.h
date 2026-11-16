@@ -35,6 +35,7 @@ struct Entry {
     QString url;
     QString login;
     QString password;
+    QString email;
 
     Entry() = default;
     Entry(const Entry &) = delete;

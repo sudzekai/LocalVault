@@ -121,8 +121,9 @@ MainWindow::MainWindow(const QString &path) : manager(path)
     button(searchRow, vaultPage, QStringLiteral("Добавить запись"),
            [this] { entryDialog(nullptr); }, true);
 
-    table = new QTableWidget(0, 3, vaultPage);
-    table->setHorizontalHeaderLabels({QStringLiteral("Сайт"), QStringLiteral("Логин"), QStringLiteral("Адрес")});
+    table = new QTableWidget(0, 4, vaultPage);
+    table->setHorizontalHeaderLabels({QStringLiteral("Сайт"), QStringLiteral("Логин"),
+                                     QStringLiteral("Электронная почта"), QStringLiteral("Адрес")});
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     table->verticalHeader()->hide();
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -268,7 +269,8 @@ void MainWindow::refresh(const QUuid &id)
         site->setData(Qt::UserRole, entry.id);
         table->setItem(row, 0, site);
         table->setItem(row, 1, new QTableWidgetItem(entry.login));
-        table->setItem(row, 2, new QTableWidgetItem(entry.url));
+        table->setItem(row, 2, new QTableWidgetItem(entry.email));
+        table->setItem(row, 3, new QTableWidgetItem(entry.url));
         if (entry.id == id)
             selectedRow = row;
     }

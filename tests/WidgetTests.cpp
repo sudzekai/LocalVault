@@ -72,14 +72,15 @@ void checkUi(const QString &path)
             return;
         auto *form = dialog->findChild<QFormLayout *>();
         auto *save = findButton(*dialog, QStringLiteral("Сохранить"));
-        if (!form || !save || formField(*form, 3)->echoMode() != QLineEdit::Password) {
+        if (!form || form->rowCount() != 5 || !save || formField(*form, 4)->echoMode() != QLineEdit::Password) {
             dialog->reject();
             return;
         }
         formField(*form, 0)->setText(QStringLiteral("Example"));
         formField(*form, 1)->setText(QStringLiteral("https://example.com"));
         formField(*form, 2)->setText(QStringLiteral("widget-login"));
-        formField(*form, 3)->setText(QStringLiteral("Synthetic-password-123"));
+        formField(*form, 3)->setText(QStringLiteral("  widget-email@example.com  "));
+        formField(*form, 4)->setText(QStringLiteral("Synthetic-password-123"));
         save->click();
         saved = dialog->result() == QDialog::Accepted;
         if (!saved)
@@ -87,6 +88,7 @@ void checkUi(const QString &path)
     });
     click(window, QStringLiteral("Добавить запись"));
     check(saved && table->rowCount() == 1, "entry form did not save");
+    check(table->item(0, 2)->text() == QStringLiteral("widget-email@example.com"), "email missing from the table");
 
     const auto screenshot = qEnvironmentVariable("LOCALVAULT_TEST_SCREENSHOT");
     if (!screenshot.isEmpty())
@@ -109,6 +111,7 @@ void checkUi(const QString &path)
     master->setText(password);
     click(window, QStringLiteral("Разблокировать"));
     check(table->isVisible() && table->rowCount() == 1 && search->text().isEmpty(), "reopen failed");
+    check(table->item(0, 2)->text() == QStringLiteral("widget-email@example.com"), "reopen lost email");
 }
 
 void checkIdle(const QString &path)

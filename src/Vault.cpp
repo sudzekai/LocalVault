@@ -5,9 +5,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
 #include <QUrl>
+#include <QtEndian>
 
 #include <openssl/evp.h>
 #include <sodium.h>
@@ -16,6 +18,8 @@
 #include <utility>
 
 namespace {
+constexpr quint32 originalFormat = 1;
+constexpr quint32 emailFormat = 2;
 constexpr int keySize = 32;
 constexpr int saltSize = crypto_pwhash_SALTBYTES;
 constexpr int nonceSize = 12;
@@ -60,13 +64,20 @@ QByteArray randomBytes(int size)
     return result;
 }
 
-QByteArray headerParameters(const VaultHeader &header)
+QByteArray headerParameters(const VaultHeader &header, quint32 version)
 {
     QByteArray bytes("LVLT", 4);
     QDataStream stream(&bytes, QIODevice::Append);
-    stream << quint32(1) << header.operations << header.memoryKiB;
+    stream << version << header.operations << header.memoryKiB;
     bytes.append(header.salt);
     return bytes;
+}
+
+bool validEmail(const QString &email)
+{
+    static const QRegularExpression address(QStringLiteral(R"(\A[^\s@<>]+@[^\s@<>]+\z)"),
+                                            QRegularExpression::UseUnicodePropertiesOption);
+    return email.isEmpty() || (email.size() <= maxField && address.match(email).hasMatch());
 }
 
 bool validEntry(const Entry &entry)
@@ -100,7 +111,7 @@ void readField(QDataStream &stream, QString &field)
     }
 }
 
-void serialize(const VaultData &data, QByteArray &payload)
+void serialize(const VaultData &data, QByteArray &payload, bool includeEmail)
 {
     if (data.entries.size() > maxEntries)
         fail(VaultError::Limit, QStringLiteral("Достигнут предел количества записей."));
@@ -108,6 +119,8 @@ void serialize(const VaultData &data, QByteArray &payload)
     for (const auto &entry : data.entries) {
         size += 24 + 2 * (entry.site.size() + entry.url.size()
                         + entry.login.size() + entry.password.size());
+        if (includeEmail)
+            size += 2 + 2 * entry.email.size();
     }
     if (size > maxPayload)
         fail(VaultError::Limit, QStringLiteral("Достигнут предельный размер хранилища."));
@@ -121,12 +134,14 @@ void serialize(const VaultData &data, QByteArray &payload)
         writeField(stream, entry.url);
         writeField(stream, entry.login);
         writeField(stream, entry.password);
+        if (includeEmail)
+            writeField(stream, entry.email);
     }
     if (stream.status() != QDataStream::Ok)
         fail(VaultError::Io, QStringLiteral("Не удалось подготовить записи к сохранению."));
 }
 
-VaultData deserialize(const QByteArray &payload)
+VaultData deserialize(const QByteArray &payload, bool includeEmail)
 {
     QDataStream stream(payload);
     stream.setVersion(QDataStream::Qt_6_0);
@@ -146,7 +161,10 @@ VaultData deserialize(const QByteArray &payload)
         readField(stream, entry.url);
         readField(stream, entry.login);
         readField(stream, entry.password);
-        if (stream.status() != QDataStream::Ok || !validEntry(entry) || ids.contains(entry.id))
+        if (includeEmail)
+            readField(stream, entry.email);
+        if (stream.status() != QDataStream::Ok || !validEntry(entry)
+            || !validEmail(entry.email) || ids.contains(entry.id))
             damaged();
         ids.insert(entry.id);
         data.entries.push_back(std::move(entry));
@@ -216,6 +234,7 @@ Entry &Entry::operator=(Entry &&other) noexcept
         url.swap(other.url);
         login.swap(other.login);
         password.swap(other.password);
+        email.swap(other.email);
     }
     return *this;
 }
@@ -226,6 +245,7 @@ Entry::~Entry()
     wipe(url);
     wipe(login);
     wipe(password);
+    wipe(email);
 }
 
 void CryptoManager::initialize()
@@ -254,7 +274,8 @@ Session CryptoManager::derive(VaultHeader header, const QString &password)
         || crypto_kdf_derive_from_key(check.data(), keySize, 2, "LVault01", master.data()) != 0)
         fail(VaultError::Crypto, QStringLiteral("Не удалось разделить ключи хранилища."));
 
-    const QByteArray parameters = headerParameters(session.header);
+    // Both formats use the original verifier encoding. AES-GCM authenticates the actual file version.
+    const QByteArray parameters = headerParameters(session.header, originalFormat);
     QByteArray verifier(keySize, Qt::Uninitialized);
     if (crypto_auth_hmacsha256(unsignedData(verifier), unsignedData(parameters), parameters.size(),
                                check.data()) != 0)
@@ -274,9 +295,13 @@ QByteArray CryptoManager::encrypt(const Session &session, const VaultData &data)
     SecureKey writeKey;
     deriveWriteKey(writeKey, session.key, diversifier);
 
-    QByteArray file = headerParameters(session.header) + session.header.verifier + diversifier + nonce;
+    const bool includeEmail = std::any_of(data.entries.begin(), data.entries.end(), [](const Entry &entry) {
+        return !entry.email.isEmpty();
+    });
+    QByteArray file = headerParameters(session.header, includeEmail ? emailFormat : originalFormat)
+        + session.header.verifier + diversifier + nonce;
     SecretBytes payload;
-    serialize(data, payload.value);
+    serialize(data, payload.value, includeEmail);
     file.resize(headerSize + payload.value.size() + tagSize);
     auto *bytes = unsignedData(file);
     const auto context = aesGcm(writeKey, unsignedData(nonce), true);
@@ -318,7 +343,8 @@ VaultData CryptoManager::decrypt(const Session &session, const QByteArray &file)
         damaged();
     sodium_memzero(payload.value.data() + written, EVP_MAX_BLOCK_LENGTH);
     payload.value.chop(EVP_MAX_BLOCK_LENGTH);
-    return deserialize(payload.value);
+    const auto version = qFromBigEndian<quint32>(bytes + 4);
+    return deserialize(payload.value, version == emailFormat);
 }
 
 StorageManager::StorageManager(QString path) : path(std::move(path)) {}
@@ -365,7 +391,7 @@ VaultHeader StorageManager::readHeader(const QByteArray &file)
     if (QCryptographicHash::hash(QByteArrayView(file).chopped(checksumSize), QCryptographicHash::Sha256)
             != file.last(checksumSize))
         damaged();
-    if (version != 1)
+    if (version != originalFormat && version != emailFormat)
         fail(VaultError::Version, QStringLiteral("Версия формата хранилища не поддерживается."));
     if (header.operations < 2 || header.operations > 6
         || header.memoryKiB < 32 * 1024 || header.memoryKiB > 256 * 1024)
@@ -475,7 +501,9 @@ void PasswordManager::save() const
 void PasswordManager::put(Entry entry)
 {
     if (!validEntry(entry))
-        fail(VaultError::Invalid, QStringLiteral("Заполните все поля. Ссылка должна начинаться с https:// или http://."));
+        fail(VaultError::Invalid, QStringLiteral("Укажите сайт, логин, пароль и ссылку на сайт с https:// или http://."));
+    if (!validEmail(entry.email))
+        fail(VaultError::Invalid, QStringLiteral("Введите адрес электронной почты в формате имя@домен."));
     auto &entries = records.entries;
     const auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry &item) {
         return item.id == entry.id;
