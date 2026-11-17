@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QLockFile>
 #include <QString>
 #include <QUuid>
 
@@ -118,6 +119,10 @@ public:
 class PasswordManager {
 public:
     explicit PasswordManager(QString path);
+    void selectPath(QString path, bool custom);
+    const QString &path() const { return activePath; }
+    bool usesCustomPath() const { return customPath; }
+    void checkAvailability() const;
     bool exists() const;
     bool unlocked() const { return session.has_value(); }
     void open(const QString &password);
@@ -135,9 +140,15 @@ public:
 
 private:
     const Session &activeSession() const;
-    void save() const;
+    std::unique_ptr<QLockFile> acquireAccess() const;
+    QByteArray readCurrentFile() const;
+    void commitFile(const QByteArray &file);
+    void save();
     StorageManager storage;
     QString activePath;
+    bool customPath = false;
+    QByteArray revision;
+    std::unique_ptr<QLockFile> access;
     VaultData records;
     std::optional<Session> session;
 };

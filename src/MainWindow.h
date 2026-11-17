@@ -21,6 +21,8 @@ protected:
     bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
+    void vaultLocationDialog();
+    void saveVaultLocation(const QString &customPath);
     void showLocked();
     void showUnlocked();
     void lock();
@@ -41,6 +43,9 @@ private:
     void exportVault();
     void showError(const Failure &error);
 
+    QString defaultVaultPath;
+    QString locationSettingsPath;
+    QString locationError;
     PasswordManager manager;
     QElapsedTimer activity;
     QTimer idleTimer;

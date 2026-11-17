@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QFile>
 #include <QTemporaryDir>
 #include <QtEndian>
 
@@ -182,7 +183,8 @@ void checkRollback()
 {
     QTemporaryDir dir;
     check(dir.isValid() && QDir().mkpath(dir.filePath(QStringLiteral("active"))), "rollback directory");
-    PasswordManager manager(dir.filePath(QStringLiteral("active/vault.lvault")));
+    const auto path = dir.filePath(QStringLiteral("active/vault.lvault"));
+    PasswordManager manager(path);
     manager.create(QStringLiteral("rollback test password"));
     auto group = site(QStringLiteral("Сайт"), QStringLiteral("https://example.com"));
     const auto id = group.id;
@@ -190,7 +192,7 @@ void checkRollback()
     auto entry = account(id, QStringLiteral("retained"));
     const auto accountId = entry.id;
     manager.put(std::move(entry));
-    check(QDir(dir.path()).rename(QStringLiteral("active"), QStringLiteral("moved")), "rename active directory");
+    check(QFile::rename(path, dir.filePath(QStringLiteral("moved.lvault"))), "rename active vault");
     expectError(VaultError::Io, [&] { manager.put(account(id, QStringLiteral("discarded"))); });
     expectError(VaultError::Io, [&] { manager.remove(accountId); });
     expectError(VaultError::Io, [&] { manager.removeSite(id); });
@@ -198,6 +200,53 @@ void checkRollback()
     check(manager.data().sites.size() == 1 && manager.data().sites[0].id == id
           && manager.data().entries.size() == 1 && manager.data().entries[0].id == accountId
           && manager.data().idleMinutes == 5, "failed write changed in-memory state");
+}
+
+void checkExternalPath()
+{
+    QTemporaryDir dir;
+    check(dir.isValid(), "external path test directory");
+    const auto defaultPath = dir.filePath(QStringLiteral("default.lvault"));
+    const auto externalPath = dir.filePath(QStringLiteral("shared.lvault"));
+    const auto missingPath = dir.filePath(QStringLiteral("missing.lvault"));
+    const auto password = QStringLiteral("external file test password");
+    {
+        PasswordManager original(externalPath);
+        original.create(password);
+        original.putSite(site(QStringLiteral("Shared"), QStringLiteral("https://shared.example")));
+    }
+
+    PasswordManager client(defaultPath);
+    client.selectPath(missingPath, true);
+    expectError(VaultError::Io, [&] { client.open(password); });
+    expectError(VaultError::Invalid, [&] { client.create(password); });
+    expectError(VaultError::Io, [&] { client.importFrom(externalPath, password); });
+    check(!QFile::exists(missingPath) && !QFile::exists(defaultPath), "missing path created a vault");
+
+    client.selectPath(externalPath, true);
+    client.open(password);
+    PasswordManager other(defaultPath);
+    other.selectPath(externalPath, true);
+    expectError(VaultError::Io, [&] { other.open(password); });
+    const auto unavailable = dir.filePath(QStringLiteral("offline.lvault"));
+    check(QFile::rename(externalPath, unavailable), "could not take external file offline");
+    expectError(VaultError::Io, [&] {
+        client.putSite(site(QStringLiteral("Discarded"), QStringLiteral("https://discarded.example")));
+    });
+    check(!QFile::exists(externalPath) && client.data().sites.size() == 1, "offline write changed state");
+    check(QFile::rename(unavailable, externalPath), "could not restore external file");
+    const auto originalBytes = StorageManager(externalPath).read();
+    auto modifiedBytes = originalBytes;
+    modifiedBytes[110] = char(modifiedBytes[110] ^ 1);
+    StorageManager(externalPath).write(modifiedBytes);
+    expectError(VaultError::Io, [&] { client.setIdleMinutes(18); });
+    check(StorageManager(externalPath).read() == modifiedBytes && client.data().idleMinutes == 5,
+          "unexpected external modification was overwritten");
+    StorageManager(externalPath).write(originalBytes);
+    client.putSite(site(QStringLiteral("Next"), QStringLiteral("https://next.example")));
+    client.lock();
+    other.open(password);
+    check(other.data().sites.size() == 2 && !QFile::exists(defaultPath), "changes were not saved directly");
 }
 }
 
@@ -208,6 +257,7 @@ int main(int argc, char *argv[])
         CryptoManager::initialize();
         checkVault();
         checkRollback();
+        checkExternalPath();
         checkGenerator();
         std::cout << "Vault checks passed.\n";
     } catch (const Failure &failure) {

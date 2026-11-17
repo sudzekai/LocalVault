@@ -3,6 +3,8 @@
 
 #include <QCheckBox>
 #include <QDateTimeEdit>
+#include <QDir>
+#include <QFileInfo>
 #include <QLocale>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -11,6 +13,7 @@
 #include <QFormLayout>
 #include <QMessageBox>
 #include <QScopeGuard>
+#include <QSettings>
 #include <QSpinBox>
 
 namespace {
@@ -445,12 +448,96 @@ void MainWindow::changePassword()
     dialog.exec();
 }
 
+void MainWindow::saveVaultLocation(const QString &customPath)
+{
+    QSettings location(locationSettingsPath, QSettings::IniFormat);
+    if (customPath.isEmpty())
+        location.remove(QStringLiteral("vaultPath"));
+    else
+        location.setValue(QStringLiteral("vaultPath"), customPath);
+    location.sync();
+    if (location.status() != QSettings::NoError)
+        throw Failure{VaultError::Io, QStringLiteral("Не удалось сохранить настройки пути.")};
+
+    manager.selectPath(customPath.isEmpty() ? defaultVaultPath : customPath, !customPath.isEmpty());
+    locationError.clear();
+}
+
+void MainWindow::vaultLocationDialog()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Путь к хранилищу"));
+    dialog.setMinimumWidth(570);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(20, 18, 20, 16);
+    layout->setSpacing(12);
+    auto *form = stackedForm(layout);
+    auto *path = new QLineEdit(QDir::toNativeSeparators(manager.path()), &dialog);
+    path->setPlaceholderText(QStringLiteral("Абсолютный путь к файлу .lvault"));
+    auto *row = new QHBoxLayout;
+    row->setSpacing(8);
+    row->addWidget(path, 1);
+    button(row, &dialog, QStringLiteral("Обзор…"), [&] {
+        const auto chosen = QFileDialog::getOpenFileName(&dialog, QStringLiteral("Выберите хранилище"), path->text(),
+            QStringLiteral("Хранилище LocalVault (*.lvault)"), nullptr, QFileDialog::DontUseNativeDialog);
+        if (!chosen.isEmpty())
+            path->setText(QDir::toNativeSeparators(chosen));
+    });
+    form->addRow(QStringLiteral("Файл хранилища"), row);
+    layout->addWidget(label(QStringLiteral("По умолчанию: %1").arg(QDir::toNativeSeparators(defaultVaultPath)), &dialog));
+    auto *error = label({}, &dialog, "error");
+    layout->addWidget(error);
+
+    const auto apply = [&](const QString &customPath) {
+        try {
+            if (!customPath.isEmpty()) {
+                const QFileInfo file(customPath);
+                if (!QDir::isAbsolutePath(customPath) || !file.isFile()
+                    || file.suffix().compare(QStringLiteral("lvault"), Qt::CaseInsensitive) != 0)
+                    throw Failure{VaultError::Invalid, QStringLiteral("Укажите полный путь к существующему файлу .lvault.")};
+                StorageManager::readHeader(StorageManager(customPath).read());
+            }
+            saveVaultLocation(customPath);
+            dialog.accept();
+        } catch (const Failure &failure) {
+            error->setText(failure.message);
+        }
+    };
+
+    auto *actions = new QHBoxLayout;
+    layout->addLayout(actions);
+    button(actions, &dialog, QStringLiteral("Сбросить путь"), [&] { apply({}); });
+    actions->addStretch();
+    auto *controls = dialogButtons(dialog, actions, QStringLiteral("Сохранить"), true);
+    connect(controls, &QDialogButtonBox::accepted, &dialog, [&] {
+        const auto entered = path->text().trimmed();
+        if (entered.isEmpty()) {
+            error->setText(QStringLiteral("Укажите путь к файлу или нажмите «Сбросить путь»."));
+            return;
+        }
+        apply(QDir::cleanPath(QDir::fromNativeSeparators(entered)));
+    });
+
+    if (dialog.exec() == QDialog::Accepted) {
+        clearFields({master, repeat});
+        showLocked();
+    }
+}
+
 void MainWindow::importVault()
 {
     const bool wasUnlocked = manager.unlocked();
-    if (!wasUnlocked && manager.exists()) {
-        authError->setText(QStringLiteral("Разблокируйте текущее хранилище перед импортом."));
-        return;
+    if (!wasUnlocked) {
+        try {
+            if (!locationError.isEmpty())
+                throw Failure{VaultError::Io, locationError};
+            manager.checkAvailability();
+            if (manager.usesCustomPath() || manager.exists())
+                throw Failure{VaultError::Invalid, QStringLiteral("Разблокируйте текущее хранилище перед импортом.")};
+        } catch (const Failure &error) {
+            authError->setText(error.message);
+            return;
+        }
     }
     const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Импорт хранилища"), {},
         QStringLiteral("Хранилище LocalVault (*.lvault);;Все файлы (*)"), nullptr, QFileDialog::DontUseNativeDialog);

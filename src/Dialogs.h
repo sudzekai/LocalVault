@@ -18,7 +18,7 @@ QIcon actionIcon(const char *name);
 void setAction(QAbstractButton *control, const QString &title, const char *icon);
 QPushButton *iconButton(QBoxLayout *layout, QWidget *parent, const QString &title,
                         const char *icon, const std::function<void()> &action);
-QDialogButtonBox *dialogButtons(QDialog &dialog, QVBoxLayout *layout, const QString &acceptText, bool textButtons = false);
+QDialogButtonBox *dialogButtons(QDialog &dialog, QBoxLayout *layout, const QString &acceptText, bool textButtons = false);
 QLineEdit *secretField(QWidget *parent, int maxLength = 2048);
 QString takeText(QLineEdit *field);
 void clearText(QLineEdit *field);

@@ -519,6 +519,21 @@ Session AuthManager::unlock(const QByteArray &file, const QString &password)
 
 PasswordManager::PasswordManager(QString path) : storage(path), activePath(std::move(path)) {}
 
+void PasswordManager::selectPath(QString path, bool custom)
+{
+    if (unlocked())
+        fail(VaultError::Invalid, QStringLiteral("Заблокируйте хранилище, чтобы изменить путь."));
+    storage = StorageManager(path);
+    activePath = std::move(path);
+    customPath = custom;
+}
+
+void PasswordManager::checkAvailability() const
+{
+    if (customPath && !QFileInfo(activePath).isFile())
+        fail(VaultError::Io, QStringLiteral("Файл хранилища по выбранному пути недоступен. Проверьте путь в настройках."));
+}
+
 bool PasswordManager::exists() const
 {
     return storage.exists();
@@ -526,19 +541,26 @@ bool PasswordManager::exists() const
 
 void PasswordManager::open(const QString &password)
 {
+    auto fileAccess = acquireAccess();
     const QByteArray file = storage.read();
     auto candidate = AuthManager::unlock(file, password);
     auto decoded = CryptoManager::decrypt(candidate, file);
     records = std::move(decoded);
+    revision = QCryptographicHash::hash(file, QCryptographicHash::Sha256);
+    access = std::move(fileAccess);
     session.emplace(std::move(candidate));
 }
 
 void PasswordManager::create(const QString &password)
 {
+    if (customPath)
+        fail(VaultError::Invalid, QStringLiteral("Для выбранного пути требуется существующий файл хранилища."));
     if (exists())
         fail(VaultError::Io, QStringLiteral("Хранилище уже существует."));
+    auto fileAccess = acquireAccess();
     auto candidate = AuthManager::create(password);
-    storage.write(CryptoManager::encrypt(candidate, records));
+    commitFile(CryptoManager::encrypt(candidate, records));
+    access = std::move(fileAccess);
     session.emplace(std::move(candidate));
 }
 
@@ -546,28 +568,34 @@ void PasswordManager::lock()
 {
     session.reset();
     records = VaultData{};
+    revision.clear();
+    access.reset();
 }
 
 void PasswordManager::changePassword(const QString &current, const QString &next)
 {
     activeSession();
-    const auto file = storage.read();
+    const auto file = readCurrentFile();
     const auto verified = AuthManager::unlock(file, current);
     CryptoManager::decrypt(verified, file);
     auto candidate = AuthManager::create(next);
-    storage.write(CryptoManager::encrypt(candidate, records));
+    commitFile(CryptoManager::encrypt(candidate, records));
     session.emplace(std::move(candidate));
 }
 
 void PasswordManager::importFrom(const QString &path, const QString &password)
 {
-    if (storage.exists())
+    checkAvailability();
+    if (customPath || storage.exists())
         activeSession();
+    auto fileAccess = unlocked() ? std::unique_ptr<QLockFile>{} : acquireAccess();
     const QByteArray file = StorageManager(path).read();
     auto candidate = AuthManager::unlock(file, password);
     auto decoded = CryptoManager::decrypt(candidate, file);
-    storage.write(file);
+    commitFile(file);
     records = std::move(decoded);
+    if (fileAccess)
+        access = std::move(fileAccess);
     session.emplace(std::move(candidate));
 }
 
@@ -582,7 +610,7 @@ void PasswordManager::exportTo(const QString &path) const
 #endif
             ) == 0)
         fail(VaultError::Invalid, QStringLiteral("Выберите другой файл для резервной копии."));
-    const QByteArray file = storage.read();
+    const QByteArray file = readCurrentFile();
     StorageManager::readHeader(file);
     CryptoManager::decrypt(current, file);
     StorageManager(path).write(file);
@@ -595,9 +623,41 @@ const Session &PasswordManager::activeSession() const
     return *session;
 }
 
-void PasswordManager::save() const
+std::unique_ptr<QLockFile> PasswordManager::acquireAccess() const
 {
-    storage.write(CryptoManager::encrypt(activeSession(), records));
+    checkAvailability();
+    auto fileAccess = std::make_unique<QLockFile>(comparablePath(activePath) + QStringLiteral(".lock"));
+    fileAccess->setStaleLockTime(0);
+    if (!fileAccess->tryLock(0))
+        fail(VaultError::Io, fileAccess->error() == QLockFile::LockFailedError
+            ? QStringLiteral("Это хранилище уже открыто. Закройте его на другом устройстве или в другом окне.")
+            : QStringLiteral("Не удалось получить доступ на запись к файлу хранилища."));
+    return fileAccess;
+}
+
+QByteArray PasswordManager::readCurrentFile() const
+{
+    checkAvailability();
+    const auto file = storage.read();
+    if (QCryptographicHash::hash(file, QCryptographicHash::Sha256) != revision)
+        fail(VaultError::Io, QStringLiteral("Файл хранилища изменился вне приложения. Заблокируйте и откройте его снова."));
+    return file;
+}
+
+void PasswordManager::commitFile(const QByteArray &file)
+{
+    if (!revision.isEmpty())
+        readCurrentFile();
+    else if (storage.exists())
+        fail(VaultError::Io, QStringLiteral("Хранилище уже существует."));
+    const auto nextRevision = QCryptographicHash::hash(file, QCryptographicHash::Sha256);
+    storage.write(file);
+    revision = nextRevision;
+}
+
+void PasswordManager::save()
+{
+    commitFile(CryptoManager::encrypt(activeSession(), records));
 }
 
 namespace {

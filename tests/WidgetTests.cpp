@@ -3,6 +3,8 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDialog>
+#include <QDir>
+#include <QFile>
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -101,7 +103,10 @@ void interact(MainWindow &window, const QString &title, Function operation)
             dialog->reject();
         }
     });
-    click(window, title);
+    if (findButton(window, title))
+        click(window, title);
+    else
+        textButton(window, title)->click();
     if (error)
         std::rethrow_exception(error);
     check(observed, "expected a modal form");
@@ -276,6 +281,61 @@ void checkIdle(const QString &path)
     wait.exec();
     check(!sites->isVisible() && QApplication::activeModalWidget() == nullptr, "idle lock failed");
 }
+
+void checkSavedPath(const QString &defaultPath, const QString &externalPath)
+{
+    const auto masterPassword = QStringLiteral("test password for selected path");
+    {
+        PasswordManager external(externalPath);
+        external.create(masterPassword);
+    }
+    {
+        MainWindow window(defaultPath);
+        window.show();
+        QApplication::processEvents();
+        interact(window, QStringLiteral("Настройки"), [&](QDialog &dialog) {
+            auto *path = field(dialog, QStringLiteral("Абсолютный путь к файлу .lvault"));
+            path->setText(externalPath + QStringLiteral(".missing.lvault"));
+            textButton(dialog, QStringLiteral("Сохранить"))->click();
+            check(dialog.isVisible(), "invalid selection closed settings");
+            path->setText(externalPath);
+            textButton(dialog, QStringLiteral("Сохранить"))->click();
+            check(dialog.result() == QDialog::Accepted, "valid location was not saved");
+        });
+        textButton(window, QStringLiteral("Разблокировать"));
+    }
+    {
+        MainWindow window(defaultPath);
+        window.show();
+        QApplication::processEvents();
+        field(window, QStringLiteral("Мастер-пароль"))->setText(masterPassword);
+        textButton(window, QStringLiteral("Разблокировать"))->click();
+        check(window.findChild<QListWidget *>()->isVisible(), "path was not loaded on restart");
+        check(!QFile::exists(defaultPath), "external unlock created the default file");
+    }
+    check(QFile::rename(externalPath, externalPath + QStringLiteral(".offline")), "external test rename failed");
+    {
+        MainWindow window(defaultPath);
+        window.show();
+        QApplication::processEvents();
+        textButton(window, QStringLiteral("Разблокировать"))->click();
+        auto *error = window.findChild<QLabel *>(QStringLiteral("error"));
+        check(error && error->isVisible() && error->text().contains(QStringLiteral("недоступен")),
+              "missing selected file did not show an error");
+        check(!QFile::exists(defaultPath) && !QFile::exists(externalPath), "missing path created a file");
+        interact(window, QStringLiteral("Настройки"), [&](QDialog &dialog) {
+            auto *path = field(dialog, QStringLiteral("Абсолютный путь к файлу .lvault"));
+            check(QDir::fromNativeSeparators(path->text()) == externalPath, "missing path was forgotten");
+            textButton(dialog, QStringLiteral("Сбросить путь"))->click();
+            check(dialog.result() == QDialog::Accepted, "reset didn't close settings");
+        });
+        textButton(window, QStringLiteral("Создать"));
+    }
+    MainWindow window(defaultPath);
+    window.show();
+    QApplication::processEvents();
+    textButton(window, QStringLiteral("Создать"));
+}
 }
 
 int main(int argc, char *argv[])
@@ -288,8 +348,11 @@ int main(int argc, char *argv[])
         CryptoManager::initialize();
         if (app.arguments().contains(QStringLiteral("--idle")))
             checkIdle(directory.filePath(QStringLiteral("idle.lvault")));
-        else
+        else {
             checkUi(directory.filePath(QStringLiteral("widgets.lvault")));
+            checkSavedPath(directory.filePath(QStringLiteral("default.lvault")),
+                           directory.filePath(QStringLiteral("external.lvault")));
+        }
         std::cout << "Widget checks passed.\n";
     } catch (const Failure &failure) {
         std::cerr << failure.message.toStdString() << '\n';

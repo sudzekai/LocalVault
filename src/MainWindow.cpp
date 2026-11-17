@@ -4,6 +4,8 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
+#include <QDir>
+#include <QFileInfo>
 #include <QCollator>
 #include <QListWidget>
 #include <QLocale>
@@ -12,6 +14,7 @@
 #include <QPalette>
 #include <QScopeGuard>
 #include <QScrollArea>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QStackedWidget>
 
@@ -22,8 +25,18 @@ namespace {
 constexpr char tokenFormat[] = "application/x-localvault-copy-token";
 }
 
-MainWindow::MainWindow(const QString &path) : manager(path)
+MainWindow::MainWindow(const QString &path)
+    : defaultVaultPath(path),
+      locationSettingsPath(QFileInfo(path).absoluteDir().filePath(QStringLiteral("vault-location.ini"))),
+      manager(path)
 {
+    QSettings location(locationSettingsPath, QSettings::IniFormat);
+    const auto customPath = location.value(QStringLiteral("vaultPath")).toString();
+    if (location.status() != QSettings::NoError || (!customPath.isEmpty() && !QDir::isAbsolutePath(customPath)))
+        locationError = QStringLiteral("Не удалось прочитать сохранённый путь. Выберите файл или сбросьте путь в настройках.");
+    else if (!customPath.isEmpty())
+        manager.selectPath(customPath, true);
+
     setWindowTitle(QStringLiteral("LocalVault"));
     setMinimumSize(780, 520);
     resize(1080, 690);
@@ -93,7 +106,7 @@ MainWindow::MainWindow(const QString &path) : manager(path)
         QString again = takeText(repeat);
         const auto cleanup = qScopeGuard([&] { wipe(password); wipe(again); });
         try {
-            if (manager.exists()) {
+            if (manager.usesCustomPath() || manager.exists()) {
                 manager.open(password);
             } else {
                 if (password != again)
@@ -108,6 +121,7 @@ MainWindow::MainWindow(const QString &path) : manager(path)
     }, true);
     authRow->addStretch();
     button(authRow, card, QStringLiteral("Импортировать копию"), [this] { importVault(); });
+    button(authRow, card, QStringLiteral("Настройки"), [this] { vaultLocationDialog(); });
     connect(master, &QLineEdit::returnPressed, this, [this] {
         if (repeat->isVisible())
             repeat->setFocus();
@@ -255,13 +269,19 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event)
 void MainWindow::showLocked()
 {
     pages->setCurrentWidget(lockedPage);
-    const bool existing = manager.exists();
+    const bool existing = !locationError.isEmpty() || manager.usesCustomPath() || manager.exists();
     authTitle->setText(existing ? QStringLiteral("Хранилище заблокировано") : QStringLiteral("Создайте хранилище"));
     authHint->setText(existing ? QStringLiteral("Введите мастер-пароль, чтобы открыть записи.")
                                : QStringLiteral("Установите мастер-пароль длиной не менее 12 символов."));
     authButton->setText(existing ? QStringLiteral("Разблокировать") : QStringLiteral("Создать"));
+    authButton->setEnabled(locationError.isEmpty());
     repeat->setVisible(!existing);
-    authError->clear();
+    authError->setText(locationError);
+    try {
+        manager.checkAvailability();
+    } catch (const Failure &error) {
+        authError->setText(error.message);
+    }
     master->setFocus();
 }
 

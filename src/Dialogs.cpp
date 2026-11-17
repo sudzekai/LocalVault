@@ -98,7 +98,7 @@ QPushButton *iconButton(QBoxLayout *layout, QWidget *parent, const QString &titl
     return control;
 }
 
-QDialogButtonBox *dialogButtons(QDialog &dialog, QVBoxLayout *layout, const QString &acceptText, bool textButtons)
+QDialogButtonBox *dialogButtons(QDialog &dialog, QBoxLayout *layout, const QString &acceptText, bool textButtons)
 {
     auto *result = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
     auto *accept = result->addButton(acceptText, QDialogButtonBox::AcceptRole);
