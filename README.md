@@ -4,7 +4,10 @@ LocalVault — локальный менеджер паролей для Windows
 
 ## Быстрый запуск
 
-Скачайте архив для своей ОС со [страницы релизов](https://github.com/sudzekai/LocalVault/releases). На Windows запустите `LocalVault.exe` из распакованного архива. Держите DLL и плагины рядом с EXE. На Debian 12 установите `libqt6widgets6 libqt6svg6 qt6-qpa-plugins qt6-translations-l10n libsodium23 libssl3` и запустите `./bin/LocalVault` из распакованного архива.
+Скачайте архив для своей ОС со [страницы релизов](https://github.com/sudzekai/LocalVault/releases) и полностью распакуйте его. Обе сборки включают Qt, плагины и криптобиблиотеки.
+
+- **Windows x64.** Запустите `LocalVault.exe` из распакованной папки.
+- **Linux x64.** Запустите `./LocalVault` из распакованной папки. Требуется графический сеанс и Linux с glibc 2.36 или новее (например, Debian 12). Устанавливать отдельные пакеты Qt и криптобиблиотек не требуется.
 
 Создайте хранилище с мастер-паролем длиной от 12 символов или импортируйте зашифрованную копию. Хранилище находится в `%LOCALAPPDATA%\LocalVault V2\vault.lvault` на Windows и в `${XDG_DATA_HOME:-$HOME/.local/share}/LocalVault V2/vault.lvault` на Linux.
 
