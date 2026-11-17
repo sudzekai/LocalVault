@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
-project(LocalVault VERSION 1.0.0 LANGUAGES CXX)
+project(LocalVault VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Widgets Svg)
 find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
 find_path(SODIUM_INCLUDE_DIR NAMES sodium.h REQUIRED)
 find_library(SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
@@ -24,7 +24,15 @@ target_include_directories(vault_core PUBLIC src)
 target_link_libraries(vault_core PUBLIC Qt6::Core Sodium::Sodium PRIVATE OpenSSL::Crypto)
 
 add_library(vault_widgets STATIC src/MainWindow.cpp src/VaultActions.cpp src/Dialogs.cpp)
-target_link_libraries(vault_widgets PUBLIC vault_core Qt6::Widgets)
+target_link_libraries(vault_widgets PUBLIC vault_core Qt6::Widgets PRIVATE Qt6::Svg)
+qt_add_resources(vault_widgets bootstrap_icons PREFIX "/actions" BASE "assets/bootstrap" FILES
+    assets/bootstrap/plus-lg.svg assets/bootstrap/dash-lg.svg assets/bootstrap/trash.svg
+    assets/bootstrap/pencil.svg assets/bootstrap/eye.svg assets/bootstrap/eye-slash.svg
+    assets/bootstrap/box-arrow-up-right.svg assets/bootstrap/copy.svg assets/bootstrap/shuffle.svg
+    assets/bootstrap/gear.svg assets/bootstrap/lock.svg assets/bootstrap/box-arrow-in-down.svg
+    assets/bootstrap/box-arrow-up.svg assets/bootstrap/check-lg.svg assets/bootstrap/x-lg.svg
+    assets/bootstrap/key.svg assets/bootstrap/globe2.svg
+)
 qt_add_executable(LocalVault WIN32 src/main.cpp)
 target_link_libraries(LocalVault PRIVATE vault_widgets)
 qt_add_resources(LocalVault application_icon

@@ -9,7 +9,8 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QStackedWidget;
-class QTableWidget;
+class QListWidget;
+class QScrollArea;
 
 class MainWindow : public QMainWindow {
 public:
@@ -23,10 +24,15 @@ private:
     void showLocked();
     void showUnlocked();
     void lock();
-    void refresh(const QUuid &id = {});
-    const Entry *selected() const;
+    void refresh(const QUuid &siteId = {});
+    void renderSite();
+    const Site *currentSite() const;
+    const Entry *account(const QUuid &id) const;
+    void siteDialog(const Site *site = nullptr);
+    void removeSite();
     void entryDialog(const Entry *entry, bool readOnly = false);
-    void removeEntry();
+    void removeEntry(const QUuid &id);
+    void updateAccountCount();
     void copy(const QString &value);
     void clearClipboard();
     void settings();
@@ -50,8 +56,13 @@ private:
     QLineEdit *repeat;
     QPushButton *authButton;
     QLineEdit *search;
-    QTableWidget *table;
+    QListWidget *sites;
+    QScrollArea *cards;
+    QLabel *siteTitle;
+    QLabel *siteAddress;
+    QList<QPushButton *> siteActions;
+    QUuid selectedSite;
+    int accountCount = 0;
     QLabel *status;
     QLabel *idleLabel;
-    QList<QPushButton *> selectionActions;
 };

@@ -1,10 +1,14 @@
 #include "Dialogs.h"
 
 #include <QCheckBox>
+#include <QFile>
 #include <QFormLayout>
+#include <QHash>
 #include <QKeyEvent>
+#include <QPainter>
 #include <QProgressBar>
 #include <QSpinBox>
+#include <QSvgRenderer>
 
 namespace {
 class SecretField : public QLineEdit {
@@ -43,13 +47,72 @@ QPushButton *button(QBoxLayout *layout, QWidget *parent, const QString &text,
     return result;
 }
 
-QDialogButtonBox *dialogButtons(QDialog &dialog, QVBoxLayout *layout, const QString &acceptText)
+QIcon actionIcon(const char *name)
+{
+    static const bool initialized = [] { Q_INIT_RESOURCE(bootstrap_icons); return true; }();
+    Q_UNUSED(initialized);
+    static QHash<QByteArray, QIcon> cache;
+    const QByteArray key(name);
+    const auto found = cache.constFind(key);
+    if (found != cache.cend())
+        return found.value();
+    QFile file(QStringLiteral(":/actions/%1.svg").arg(QString::fromLatin1(name)));
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    QByteArray svg = file.readAll();
+    svg.replace("currentColor", "#ffffff");
+    QSvgRenderer renderer(svg);
+    if (!renderer.isValid())
+        return {};
+    QIcon icon;
+    for (int scale : {1, 2, 3}) {
+        QPixmap image(18 * scale, 18 * scale);
+        image.fill(Qt::transparent);
+        QPainter painter(&image);
+        renderer.render(&painter);
+        painter.end();
+        image.setDevicePixelRatio(scale);
+        icon.addPixmap(image);
+        icon.addPixmap(image, QIcon::Selected);
+    }
+    cache.insert(key, icon);
+    return icon;
+}
+
+void setAction(QAbstractButton *control, const QString &title, const char *icon)
+{
+    control->setText({});
+    control->setToolTip(title);
+    control->setAccessibleName(title);
+    control->setIcon(actionIcon(icon));
+    control->setIconSize(QSize(18, 18));
+    control->setMinimumSize(36, 34);
+    control->setCursor(Qt::PointingHandCursor);
+}
+
+QPushButton *iconButton(QBoxLayout *layout, QWidget *parent, const QString &title,
+                        const char *icon, const std::function<void()> &action)
+{
+    auto *control = button(layout, parent, {}, action);
+    setAction(control, title, icon);
+    return control;
+}
+
+QDialogButtonBox *dialogButtons(QDialog &dialog, QVBoxLayout *layout, const QString &acceptText, bool textButtons)
 {
     auto *result = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
     auto *accept = result->addButton(acceptText, QDialogButtonBox::AcceptRole);
     accept->setObjectName(QStringLiteral("primary"));
     accept->setDefault(true);
-    result->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("Отмена"));
+    auto *cancel = result->button(QDialogButtonBox::Cancel);
+    if (textButtons) {
+        cancel->setText(QStringLiteral("Отмена"));
+        cancel->setMinimumWidth(96);
+        accept->setMinimumWidth(110);
+    } else {
+        setAction(accept, acceptText, "check-lg");
+        setAction(cancel, QStringLiteral("Отмена"), "x-lg");
+    }
     layout->addWidget(result);
     QObject::connect(result, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     return result;
@@ -98,12 +161,17 @@ void addStrength(QVBoxLayout *layout, QLineEdit *field)
     update(field->text());
 }
 
-void addReveal(QVBoxLayout *layout, QLineEdit *field)
+void addReveal(QHBoxLayout *row, QLineEdit *field)
 {
-    auto *reveal = new QCheckBox(QStringLiteral("Показать пароль"), field->parentWidget());
-    layout->addWidget(reveal);
-    QObject::connect(reveal, &QCheckBox::toggled, field, [field](bool shown) {
+    auto *reveal = new QPushButton(field->parentWidget());
+    reveal->setCheckable(true);
+    setAction(reveal, QStringLiteral("Показать пароль"), "eye");
+    row->addWidget(reveal);
+    reveal->setFocusPolicy(Qt::StrongFocus);
+    QObject::connect(reveal, &QPushButton::toggled, field, [field, reveal](bool shown) {
         field->setEchoMode(shown ? QLineEdit::Normal : QLineEdit::Password);
+        setAction(reveal, shown ? QStringLiteral("Скрыть пароль") : QStringLiteral("Показать пароль"),
+                  shown ? "eye-slash" : "eye");
     });
 }
 
@@ -130,8 +198,10 @@ GeneratorDialog::GeneratorDialog(QWidget *parent, const QString &acceptText) : Q
     layout->addLayout(options);
     result = secretField(this, 256);
     result->setReadOnly(true);
-    layout->addWidget(result);
-    addReveal(layout, result);
+    auto *resultRow = new QHBoxLayout;
+    layout->addLayout(resultRow);
+    resultRow->addWidget(result, 1);
+    addReveal(resultRow, result);
     addStrength(layout, result);
     auto *error = label({}, this, "error");
     layout->addWidget(error);
@@ -147,7 +217,10 @@ GeneratorDialog::GeneratorDialog(QWidget *parent, const QString &acceptText) : Q
             error->setText(failure.message);
         }
     };
-    button(layout, this, QStringLiteral("Сгенерировать"), regenerate);
+    auto *action = new QHBoxLayout;
+    layout->addLayout(action);
+    iconButton(action, this, QStringLiteral("Сгенерировать"), "shuffle", regenerate);
+    action->addStretch();
     auto *buttons = dialogButtons(*this, layout, acceptText);
     connect(buttons, &QDialogButtonBox::accepted, this, [this] {
         if (!result->text().isEmpty())

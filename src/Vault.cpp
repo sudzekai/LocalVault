@@ -8,18 +8,18 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSet>
+#include <QTimeZone>
 #include <QUrl>
-#include <QtEndian>
 
 #include <openssl/evp.h>
 #include <sodium.h>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace {
-constexpr quint32 originalFormat = 1;
-constexpr quint32 emailFormat = 2;
+constexpr quint32 vaultFormat = 3;
 constexpr int keySize = 32;
 constexpr int saltSize = crypto_pwhash_SALTBYTES;
 constexpr int nonceSize = 12;
@@ -31,6 +31,7 @@ constexpr qsizetype maxPayload = 16 * 1024 * 1024;
 constexpr qsizetype maxFile = maxPayload + headerSize + tagSize + checksumSize;
 constexpr int maxEntries = 10000;
 constexpr int maxField = 2048;
+constexpr qint64 noDate = std::numeric_limits<qint64>::min();
 
 [[noreturn]] void fail(VaultError code, const QString &message)
 {
@@ -64,11 +65,11 @@ QByteArray randomBytes(int size)
     return result;
 }
 
-QByteArray headerParameters(const VaultHeader &header, quint32 version)
+QByteArray headerParameters(const VaultHeader &header)
 {
     QByteArray bytes("LVLT", 4);
     QDataStream stream(&bytes, QIODevice::Append);
-    stream << version << header.operations << header.memoryKiB;
+    stream << vaultFormat << header.operations << header.memoryKiB;
     bytes.append(header.salt);
     return bytes;
 }
@@ -77,17 +78,50 @@ bool validEmail(const QString &email)
 {
     static const QRegularExpression address(QStringLiteral(R"(\A[^\s@<>]+@[^\s@<>]+\z)"),
                                             QRegularExpression::UseUnicodePropertiesOption);
-    return email.isEmpty() || (email.size() <= maxField && address.match(email).hasMatch());
+    return email.size() <= maxField && address.match(email).hasMatch();
+}
+
+bool validSite(const Site &site)
+{
+    const QUrl url(site.url, QUrl::StrictMode);
+    return !site.id.isNull() && !site.name.trimmed().isEmpty()
+        && site.name.size() <= maxField && site.url.size() <= maxField
+        && url.isValid() && !url.host().isEmpty() && url.userInfo().isEmpty()
+        && (url.scheme() == QStringLiteral("http") || url.scheme() == QStringLiteral("https"));
+}
+
+QString siteNameKey(const QString &name)
+{
+    return name.simplified().normalized(QString::NormalizationForm_C).toCaseFolded();
+}
+
+QString siteUrlKey(const QString &url)
+{
+    auto normalized = QUrl(url).adjusted(QUrl::NormalizePathSegments | QUrl::StripTrailingSlash
+                                         | QUrl::RemoveFragment);
+    if (normalized.path() == QStringLiteral("/"))
+        normalized.setPath({});
+    if ((normalized.scheme() == QStringLiteral("https") && normalized.port() == 443)
+        || (normalized.scheme() == QStringLiteral("http") && normalized.port() == 80))
+        normalized.setPort(-1);
+    return normalized.toString(QUrl::FullyEncoded);
 }
 
 bool validEntry(const Entry &entry)
 {
-    const QUrl url(entry.url, QUrl::StrictMode);
-    return !entry.id.isNull() && !entry.site.trimmed().isEmpty() && !entry.login.trimmed().isEmpty()
-        && !entry.password.isEmpty() && entry.site.size() <= maxField && entry.url.size() <= maxField
-        && entry.login.size() <= maxField && entry.password.size() <= maxField
-        && url.isValid() && !url.host().isEmpty() && url.userInfo().isEmpty()
-        && (url.scheme() == QStringLiteral("http") || url.scheme() == QStringLiteral("https"));
+    return !entry.id.isNull() && !entry.siteId.isNull() && !entry.login.trimmed().isEmpty()
+        && !entry.password.isEmpty() && entry.login.size() <= maxField && entry.password.size() <= maxField
+        && entry.userName.size() <= maxField && entry.phone.size() <= maxField
+        && (!entry.createdAt.isValid() || (entry.createdAt.date().year() >= 1
+                                        && entry.createdAt.date().year() <= 9999));
+}
+
+bool validEmails(const std::vector<EmailAddress> &emails)
+{
+    return emails.size() <= Entry::maxEmails
+        && std::all_of(emails.begin(), emails.end(), [](const EmailAddress &email) {
+            return validEmail(email.address) && email.description.size() <= maxField;
+        });
 }
 
 void writeField(QDataStream &stream, const QString &field)
@@ -111,60 +145,104 @@ void readField(QDataStream &stream, QString &field)
     }
 }
 
-void serialize(const VaultData &data, QByteArray &payload, bool includeEmail)
+void serialize(const VaultData &data, QByteArray &payload)
 {
-    if (data.entries.size() > maxEntries)
-        fail(VaultError::Limit, QStringLiteral("Достигнут предел количества записей."));
-    qsizetype size = 8;
+    if (data.sites.size() > maxEntries || data.entries.size() > maxEntries)
+        fail(VaultError::Limit, QStringLiteral("Достигнут предел количества сайтов или аккаунтов."));
+    qint64 size = 12;
+    for (const auto &site : data.sites)
+        size += 20 + 2 * (site.name.size() + site.url.size());
     for (const auto &entry : data.entries) {
-        size += 24 + 2 * (entry.site.size() + entry.url.size()
-                        + entry.login.size() + entry.password.size());
-        if (includeEmail)
-            size += 2 + 2 * entry.email.size();
+        size += 50 + 2 * (entry.login.size() + entry.password.size()
+                        + entry.userName.size() + entry.phone.size());
+        for (const auto &email : entry.emails)
+            size += 4 + 2 * (email.address.size() + email.description.size());
     }
     if (size > maxPayload)
         fail(VaultError::Limit, QStringLiteral("Достигнут предельный размер хранилища."));
     payload.reserve(size);
     QDataStream stream(&payload, QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
-    stream << quint32(data.idleMinutes) << quint32(data.entries.size());
+    stream << quint32(data.idleMinutes) << quint32(data.sites.size()) << quint32(data.entries.size());
+    for (const auto &site : data.sites) {
+        stream << site.id;
+        writeField(stream, site.name);
+        writeField(stream, site.url);
+    }
     for (const auto &entry : data.entries) {
-        stream << entry.id;
-        writeField(stream, entry.site);
-        writeField(stream, entry.url);
+        stream << entry.id << entry.siteId;
+        stream << (entry.createdAt.isValid() ? entry.createdAt.toMSecsSinceEpoch() : noDate);
         writeField(stream, entry.login);
         writeField(stream, entry.password);
-        if (includeEmail)
-            writeField(stream, entry.email);
+        writeField(stream, entry.userName);
+        writeField(stream, entry.phone);
+        stream << quint16(entry.emails.size());
+        for (const auto &email : entry.emails) {
+            writeField(stream, email.address);
+            writeField(stream, email.description);
+        }
     }
     if (stream.status() != QDataStream::Ok)
         fail(VaultError::Io, QStringLiteral("Не удалось подготовить записи к сохранению."));
 }
 
-VaultData deserialize(const QByteArray &payload, bool includeEmail)
+VaultData deserialize(const QByteArray &payload)
 {
     QDataStream stream(payload);
     stream.setVersion(QDataStream::Qt_6_0);
     quint32 idle = 0;
+    quint32 siteCount = 0;
     quint32 count = 0;
-    stream >> idle >> count;
-    if (idle < 1 || idle > 120 || count > maxEntries)
+    stream >> idle >> siteCount >> count;
+    if (idle < 1 || idle > 120 || siteCount > maxEntries || count > maxEntries)
         damaged();
     VaultData data;
     data.idleMinutes = int(idle);
+    data.sites.reserve(siteCount);
     data.entries.reserve(count);
+    QSet<QUuid> siteIds;
+    QSet<QString> names;
+    QSet<QString> urls;
+    while (siteCount--) {
+        Site site;
+        stream >> site.id;
+        readField(stream, site.name);
+        readField(stream, site.url);
+        const auto name = siteNameKey(site.name);
+        const auto url = siteUrlKey(site.url);
+        if (stream.status() != QDataStream::Ok || !validSite(site) || siteIds.contains(site.id)
+            || names.contains(name) || urls.contains(url))
+            damaged();
+        siteIds.insert(site.id);
+        names.insert(name);
+        urls.insert(url);
+        data.sites.push_back(std::move(site));
+    }
     QSet<QUuid> ids;
     while (count--) {
         Entry entry;
-        stream >> entry.id;
-        readField(stream, entry.site);
-        readField(stream, entry.url);
+        qint64 date = noDate;
+        quint16 emailCount = 0;
+        stream >> entry.id >> entry.siteId >> date;
+        entry.createdAt = date == noDate ? QDateTime{} : QDateTime::fromMSecsSinceEpoch(date, QTimeZone::utc());
+        if (date != noDate && !entry.createdAt.isValid())
+            damaged();
         readField(stream, entry.login);
         readField(stream, entry.password);
-        if (includeEmail)
-            readField(stream, entry.email);
+        readField(stream, entry.userName);
+        readField(stream, entry.phone);
+        stream >> emailCount;
+        if (emailCount > Entry::maxEmails)
+            damaged();
+        entry.emails.reserve(emailCount);
+        while (emailCount--) {
+            EmailAddress email;
+            readField(stream, email.address);
+            readField(stream, email.description);
+            entry.emails.push_back(std::move(email));
+        }
         if (stream.status() != QDataStream::Ok || !validEntry(entry)
-            || !validEmail(entry.email) || ids.contains(entry.id))
+            || !validEmails(entry.emails) || ids.contains(entry.id) || !siteIds.contains(entry.siteId))
             damaged();
         ids.insert(entry.id);
         data.entries.push_back(std::move(entry));
@@ -226,26 +304,56 @@ void SecureKey::Deleter::operator()(unsigned char *data) const
     sodium_free(data);
 }
 
+Site &Site::operator=(Site &&other) noexcept
+{
+    if (this != &other) {
+        id = other.id;
+        name.swap(other.name);
+        url.swap(other.url);
+    }
+    return *this;
+}
+
+Site::~Site()
+{
+    wipe(name);
+    wipe(url);
+}
+
+EmailAddress &EmailAddress::operator=(EmailAddress &&other) noexcept
+{
+    address.swap(other.address);
+    description.swap(other.description);
+    return *this;
+}
+
+EmailAddress::~EmailAddress()
+{
+    wipe(address);
+    wipe(description);
+}
+
 Entry &Entry::operator=(Entry &&other) noexcept
 {
     if (this != &other) {
         id = other.id;
-        site.swap(other.site);
-        url.swap(other.url);
+        siteId = other.siteId;
         login.swap(other.login);
         password.swap(other.password);
-        email.swap(other.email);
+        userName.swap(other.userName);
+        phone.swap(other.phone);
+        createdAt.swap(other.createdAt);
+        emails.swap(other.emails);
     }
     return *this;
 }
 
 Entry::~Entry()
 {
-    wipe(site);
-    wipe(url);
     wipe(login);
     wipe(password);
-    wipe(email);
+    wipe(userName);
+    wipe(phone);
 }
 
 void CryptoManager::initialize()
@@ -274,8 +382,7 @@ Session CryptoManager::derive(VaultHeader header, const QString &password)
         || crypto_kdf_derive_from_key(check.data(), keySize, 2, "LVault01", master.data()) != 0)
         fail(VaultError::Crypto, QStringLiteral("Не удалось разделить ключи хранилища."));
 
-    // Both formats use the original verifier encoding. AES-GCM authenticates the actual file version.
-    const QByteArray parameters = headerParameters(session.header, originalFormat);
+    const QByteArray parameters = headerParameters(session.header);
     QByteArray verifier(keySize, Qt::Uninitialized);
     if (crypto_auth_hmacsha256(unsignedData(verifier), unsignedData(parameters), parameters.size(),
                                check.data()) != 0)
@@ -295,13 +402,9 @@ QByteArray CryptoManager::encrypt(const Session &session, const VaultData &data)
     SecureKey writeKey;
     deriveWriteKey(writeKey, session.key, diversifier);
 
-    const bool includeEmail = std::any_of(data.entries.begin(), data.entries.end(), [](const Entry &entry) {
-        return !entry.email.isEmpty();
-    });
-    QByteArray file = headerParameters(session.header, includeEmail ? emailFormat : originalFormat)
-        + session.header.verifier + diversifier + nonce;
+    QByteArray file = headerParameters(session.header) + session.header.verifier + diversifier + nonce;
     SecretBytes payload;
-    serialize(data, payload.value, includeEmail);
+    serialize(data, payload.value);
     file.resize(headerSize + payload.value.size() + tagSize);
     auto *bytes = unsignedData(file);
     const auto context = aesGcm(writeKey, unsignedData(nonce), true);
@@ -343,8 +446,7 @@ VaultData CryptoManager::decrypt(const Session &session, const QByteArray &file)
         damaged();
     sodium_memzero(payload.value.data() + written, EVP_MAX_BLOCK_LENGTH);
     payload.value.chop(EVP_MAX_BLOCK_LENGTH);
-    const auto version = qFromBigEndian<quint32>(bytes + 4);
-    return deserialize(payload.value, version == emailFormat);
+    return deserialize(payload.value);
 }
 
 StorageManager::StorageManager(QString path) : path(std::move(path)) {}
@@ -391,8 +493,8 @@ VaultHeader StorageManager::readHeader(const QByteArray &file)
     if (QCryptographicHash::hash(QByteArrayView(file).chopped(checksumSize), QCryptographicHash::Sha256)
             != file.last(checksumSize))
         damaged();
-    if (version != originalFormat && version != emailFormat)
-        fail(VaultError::Version, QStringLiteral("Версия формата хранилища не поддерживается."));
+    if (version != vaultFormat)
+        fail(VaultError::Version, QStringLiteral("Эта версия LocalVault не поддерживает формат выбранного хранилища."));
     if (header.operations < 2 || header.operations > 6
         || header.memoryKiB < 32 * 1024 || header.memoryKiB > 256 * 1024)
         damaged();
@@ -498,34 +600,93 @@ void PasswordManager::save() const
     storage.write(CryptoManager::encrypt(activeSession(), records));
 }
 
-void PasswordManager::put(Entry entry)
+namespace {
+template<class Record, class Save>
+void putRecord(std::vector<Record> &items, Record record, Save save)
 {
-    if (!validEntry(entry))
-        fail(VaultError::Invalid, QStringLiteral("Укажите сайт, логин, пароль и ссылку на сайт с https:// или http://."));
-    if (!validEmail(entry.email))
-        fail(VaultError::Invalid, QStringLiteral("Введите адрес электронной почты в формате имя@домен."));
-    auto &entries = records.entries;
-    const auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry &item) {
-        return item.id == entry.id;
+    const auto it = std::find_if(items.begin(), items.end(), [&](const Record &item) {
+        return item.id == record.id;
     });
-    if (it == entries.end()) {
-        entries.push_back(std::move(entry));
+    if (it == items.end()) {
+        items.push_back(std::move(record));
         try {
             save();
         } catch (...) {
-            entries.pop_back();
+            items.pop_back();
             throw;
         }
         return;
     }
-    Entry previous(std::move(*it));
-    *it = std::move(entry);
+    Record previous(std::move(*it));
+    *it = std::move(record);
     try {
         save();
     } catch (...) {
         *it = std::move(previous);
         throw;
     }
+}
+}
+
+void PasswordManager::putSite(Site site)
+{
+    activeSession();
+    if (!validSite(site))
+        fail(VaultError::Invalid, QStringLiteral("Укажите название и адрес сайта с https:// или http://."));
+    const auto name = siteNameKey(site.name);
+    const auto url = siteUrlKey(site.url);
+    const bool duplicate = std::any_of(records.sites.begin(), records.sites.end(), [&](const Site &item) {
+        return item.id != site.id && (siteNameKey(item.name) == name || siteUrlKey(item.url) == url);
+    });
+    if (duplicate)
+        fail(VaultError::Invalid, QStringLiteral("Сайт с таким названием или адресом уже есть."));
+    putRecord(records.sites, std::move(site), [this] { save(); });
+}
+
+void PasswordManager::removeSite(const QUuid &id)
+{
+    activeSession();
+    auto &sites = records.sites;
+    const auto site = std::find_if(sites.begin(), sites.end(), [&](const Site &item) { return item.id == id; });
+    if (site == sites.end())
+        return;
+
+    auto &entries = records.entries;
+    std::vector<std::pair<std::ptrdiff_t, Entry>> removed;
+    removed.reserve(entries.size());
+    for (auto index = static_cast<std::ptrdiff_t>(entries.size()); index > 0;) {
+        --index;
+        if (entries[index].siteId == id) {
+            auto it = entries.begin() + index;
+            removed.emplace_back(index, std::move(*it));
+            entries.erase(it);
+        }
+    }
+    const auto index = site - sites.begin();
+    Site previous(std::move(*site));
+    sites.erase(site);
+    try {
+        save();
+    } catch (...) {
+        sites.insert(sites.begin() + index, std::move(previous));
+        for (auto it = removed.rbegin(); it != removed.rend(); ++it)
+            entries.insert(entries.begin() + it->first, std::move(it->second));
+        throw;
+    }
+}
+
+void PasswordManager::put(Entry entry)
+{
+    activeSession();
+    if (!validEntry(entry))
+        fail(VaultError::Invalid, QStringLiteral("Укажите логин и пароль."));
+    if (!validEmails(entry.emails))
+        fail(VaultError::Invalid, QStringLiteral("Проверьте адреса электронной почты в формате имя@домен."));
+    if (std::none_of(records.sites.begin(), records.sites.end(), [&](const Site &site) {
+            return site.id == entry.siteId;
+        }))
+        fail(VaultError::Invalid, QStringLiteral("Выберите сайт для аккаунта."));
+    putRecord(records.entries, std::move(entry), [this] { save(); });
 }
 
 void PasswordManager::remove(const QUuid &id)

@@ -28,13 +28,20 @@ void expectError(VaultError expected, Function function)
     throw std::runtime_error("expected an error");
 }
 
-Entry sample(const QString &login)
+Site site(const QString &name, const QString &url)
+{
+    Site item;
+    item.name = name;
+    item.url = url;
+    return item;
+}
+
+Entry account(const QUuid &siteId, const QString &login)
 {
     Entry entry;
-    entry.site = QStringLiteral("Пример");
-    entry.url = QStringLiteral("https://example.com/secret");
+    entry.siteId = siteId;
     entry.login = login;
-    entry.password = QStringLiteral("пароль-тільки-для-тесту🔐");
+    entry.password = QStringLiteral("пароль-только-для-теста🔐");
     return entry;
 }
 
@@ -49,8 +56,8 @@ void checkGenerator()
         symbol |= !c.isLetterOrNumber();
     }
     check(all.size() == 24 && lower && upper && digit && symbol, "generator groups");
-    const auto onlyDigits = PasswordGenerator::generate({8, false, false, true, false});
-    for (auto c : onlyDigits)
+    const auto digits = PasswordGenerator::generate({8, false, false, true, false});
+    for (auto c : digits)
         check(c.isDigit(), "generator violated enabled groups");
     expectError(VaultError::Invalid, [] { PasswordGenerator::generate({24, false, false, false, false}); });
     check(PasswordGenerator::strength(QStringLiteral("111111111111111111")) == 1, "weak password rating");
@@ -60,148 +67,137 @@ void checkVault()
 {
     QTemporaryDir dir;
     check(dir.isValid(), "temporary directory");
-    const auto active = dir.filePath(QStringLiteral("active.lvault"));
+    const auto path = dir.filePath(QStringLiteral("active.lvault"));
     const auto backup = dir.filePath(QStringLiteral("backup.lvault"));
     const auto broken = dir.filePath(QStringLiteral("broken.lvault"));
-    const auto previous = QStringLiteral("first master password");
-    const auto next = QStringLiteral("another master password");
-    const auto wrong = QStringLiteral("wrong master password");
-    StorageManager storage(active);
-    PasswordManager manager(active);
-    manager.create(previous);
-    const auto firstFile = storage.read();
+    const auto oldPassword = QStringLiteral("first test master password");
+    const auto newPassword = QStringLiteral("next test master password");
+    const auto mail = QStringLiteral("primary@example.com");
+    StorageManager storage(path);
+    PasswordManager manager(path);
+    manager.create(oldPassword);
     check(manager.unlocked(), "create did not unlock");
-    expectError(VaultError::Io, [&] { manager.create(next); });
+    const auto firstFile = storage.read();
+    check(qFromBigEndian<quint32>(firstFile.constData() + 4) == 3, "unexpected file format");
+    expectError(VaultError::Io, [&] { manager.create(newPassword); });
+    expectError(VaultError::Invalid, [&] { manager.put(account(QUuid::createUuid(), QStringLiteral("orphan"))); });
 
-    auto first = sample(QStringLiteral("account-one@example.com"));
-    const auto id = first.id;
-    manager.put(std::move(first));
-    manager.put(sample(QStringLiteral("account-two@example.com")));
-    const auto before = storage.read();
-    check(!before.contains("account-one@example.com") && !before.contains("example.com/secret"), "plaintext on disk");
-    check(firstFile.mid(96, 12) != before.mid(96, 12), "nonce repeated");
+    auto firstSite = site(QStringLiteral("Пример"), QStringLiteral("https://example.com/"));
+    const auto firstId = firstSite.id;
+    manager.putSite(std::move(firstSite));
+    expectError(VaultError::Invalid, [&] {
+        manager.putSite(site(QStringLiteral("  ПРИМЕР "), QStringLiteral("https://other.example/")));
+    });
+    expectError(VaultError::Invalid, [&] {
+        manager.putSite(site(QStringLiteral("Копия"), QStringLiteral("https://example.com")));
+    });
+    auto secondSite = site(QStringLiteral("Второй"), QStringLiteral("https://other.example/"));
+    const auto secondId = secondSite.id;
+    manager.putSite(std::move(secondSite));
+
+    auto entry = account(firstId, QStringLiteral("test-login"));
+    const auto entryId = entry.id;
+    const auto created = entry.createdAt;
+    check(created.isValid(), "new account has no date by default");
+    entry.userName = QStringLiteral("Синтетическое имя");
+    entry.phone = QStringLiteral("+1 202 555 0142");
+    EmailAddress firstMail;
+    firstMail.address = mail;
+    firstMail.description = QStringLiteral("Личная");
+    entry.emails.push_back(std::move(firstMail));
+    EmailAddress secondMail;
+    secondMail.address = QStringLiteral("secondary@example.com");
+    entry.emails.push_back(std::move(secondMail));
+    manager.put(std::move(entry));
+    auto anonymous = account(firstId, QStringLiteral("anonymous-login"));
+    anonymous.createdAt = {};
+    const auto anonymousId = anonymous.id;
+    manager.put(std::move(anonymous));
+    manager.put(account(secondId, QStringLiteral("second-site-login")));
     manager.setIdleMinutes(17);
-    auto changed = sample(QStringLiteral("changed@example.com"));
-    changed.id = id;
-    manager.put(std::move(changed));
+    auto renamed = site(QStringLiteral("Пример 2"), QStringLiteral("https://example.com/new"));
+    renamed.id = firstId;
+    manager.putSite(std::move(renamed));
 
-    manager.lock();
-    check(!manager.unlocked() && manager.data().entries.empty(), "lock retained entries");
-    expectError(VaultError::WrongPassword, [&] { manager.open(wrong); });
-    check(!manager.unlocked(), "wrong password opened session");
-    manager.open(previous);
-    check(manager.data().entries.size() == 2 && manager.data().entries[0].id == id, "record IDs");
-    check(manager.data().entries[0].login == QStringLiteral("changed@example.com"), "editing/reopen");
-    check(manager.data().entries[0].password == sample({}).password, "unicode round trip");
-    check(manager.data().idleMinutes == 17, "settings persistence");
-
-    manager.exportTo(backup);
-    check(StorageManager(backup).read() == storage.read(), "backup differs");
-    expectError(VaultError::Invalid, [&] { manager.exportTo(active); });
-    expectError(VaultError::WrongPassword, [&] { manager.changePassword(wrong, next); });
-    manager.changePassword(previous, next);
-    check(StorageManager::readHeader(storage.read()).salt != StorageManager::readHeader(before).salt, "salt reused");
-    manager.lock();
-    expectError(VaultError::WrongPassword, [&] { manager.open(previous); });
-    manager.open(next);
-    manager.remove(id);
-    check(manager.data().entries.size() == 1 && manager.data().entries[0].id != id, "remove");
     const auto current = storage.read();
+    check(firstFile.mid(96, 12) != current.mid(96, 12), "nonce repeated");
+    check(!current.contains("test-login") && !current.contains(mail.toUtf8()), "plaintext on disk");
+    manager.lock();
+    check(!manager.unlocked() && manager.data().sites.empty() && manager.data().entries.empty(), "lock retained data");
+    expectError(VaultError::WrongPassword, [&] { manager.open(newPassword); });
+    manager.open(oldPassword);
+    const auto &saved = manager.data().entries.at(0);
+    check(saved.id == entryId && saved.siteId == firstId && saved.login == QStringLiteral("test-login")
+          && saved.password == account(firstId, {}).password, "account data did not round trip");
+    check(saved.userName == QStringLiteral("Синтетическое имя") && saved.phone == QStringLiteral("+1 202 555 0142")
+          && saved.createdAt == created && saved.emails.size() == 2 && saved.emails[0].address == mail
+          && saved.emails[0].description == QStringLiteral("Личная") && saved.emails[1].description.isEmpty(),
+          "optional fields did not round trip");
+    check(!manager.data().entries[1].createdAt.isValid() && manager.data().entries[1].emails.empty()
+          && manager.data().sites[0].name == QStringLiteral("Пример 2") && manager.data().idleMinutes == 17,
+          "site or settings did not round trip");
 
-    auto tampered = StorageManager(backup).read();
+    auto invalid = account(firstId, QStringLiteral("bad-email"));
+    EmailAddress invalidEmail;
+    invalidEmail.address = QStringLiteral("invalid");
+    invalid.emails.push_back(std::move(invalidEmail));
+    expectError(VaultError::Invalid, [&] { manager.put(std::move(invalid)); });
+    manager.exportTo(backup);
+    check(StorageManager(backup).read() == current, "backup differs");
+    expectError(VaultError::Invalid, [&] { manager.exportTo(path); });
+    auto tampered = current;
     tampered[110] = char(tampered[110] ^ 1);
     StorageManager(broken).write(tampered);
-    expectError(VaultError::Damaged, [&] { manager.importFrom(broken, previous); });
+    expectError(VaultError::Damaged, [&] { manager.importFrom(broken, oldPassword); });
     tampered.chop(32);
     tampered += QCryptographicHash::hash(tampered, QCryptographicHash::Sha256);
     StorageManager(broken).write(tampered);
-    expectError(VaultError::Damaged, [&] { manager.importFrom(broken, previous); });
-    expectError(VaultError::WrongPassword, [&] { manager.importFrom(backup, next); });
-    check(storage.read() == current && manager.data().entries.size() == 1, "failed import changed state");
-    manager.importFrom(backup, previous);
-    check(manager.data().entries.size() == 2, "import did not restore");
-    manager.lock();
-    manager.open(previous);
+    expectError(VaultError::Damaged, [&] { manager.importFrom(broken, oldPassword); });
+    auto older = current;
+    older[7] = char(2);
+    older.chop(32);
+    older += QCryptographicHash::hash(older, QCryptographicHash::Sha256);
+    StorageManager(broken).write(older);
+    expectError(VaultError::Version, [&] { manager.importFrom(broken, oldPassword); });
+    check(storage.read() == current, "failed import changed disk state");
 
-    const auto subdir = dir.filePath(QStringLiteral("rollback"));
-    check(QDir().mkpath(subdir), "rollback directory");
-    PasswordManager rollback(QDir(subdir).filePath(QStringLiteral("vault.lvault")));
-    rollback.create(previous);
-    auto existing = sample(QStringLiteral("retained"));
-    const auto retainedId = existing.id;
-    rollback.put(std::move(existing));
-    check(QDir(dir.path()).rename(QStringLiteral("rollback"), QStringLiteral("moved")), "rename rollback directory");
-    expectError(VaultError::Io, [&] { rollback.put(sample(QStringLiteral("discarded"))); });
-    expectError(VaultError::Io, [&] { rollback.remove(retainedId); });
-    expectError(VaultError::Io, [&] { rollback.setIdleMinutes(19); });
-    check(rollback.data().entries.size() == 1 && rollback.data().entries[0].id == retainedId
-          && rollback.data().idleMinutes == 5, "failed write changed in-memory state");
+    expectError(VaultError::WrongPassword, [&] { manager.changePassword(newPassword, oldPassword); });
+    manager.changePassword(oldPassword, newPassword);
+    manager.lock();
+    expectError(VaultError::WrongPassword, [&] { manager.open(oldPassword); });
+    manager.open(newPassword);
+    manager.remove(anonymousId);
+    check(manager.data().entries.size() == 2, "remove account failed");
+    manager.removeSite(firstId);
+    check(manager.data().sites.size() == 1 && manager.data().entries.size() == 1
+          && manager.data().entries[0].siteId == secondId, "site deletion did not cascade");
+    manager.importFrom(backup, oldPassword);
+    manager.lock();
+    manager.open(oldPassword);
+    check(manager.data().sites.size() == 2 && manager.data().entries.size() == 3
+          && manager.data().entries[0].emails.size() == 2, "verified backup was not restored");
 }
 
-void checkOptionalEmail()
+void checkRollback()
 {
     QTemporaryDir dir;
-    check(dir.isValid(), "temporary directory for email");
-    const auto active = dir.filePath(QStringLiteral("email.lvault"));
-    const auto backup = dir.filePath(QStringLiteral("backup.lvault"));
-    const auto restoredPath = dir.filePath(QStringLiteral("restored.lvault"));
-    const auto master = QStringLiteral("master password for email");
-    const auto nextMaster = QStringLiteral("new master password for email");
-    const auto login = QStringLiteral("separate-login");
-    const auto email = QStringLiteral("optional+test@example.com");
-    StorageManager storage(active);
-    PasswordManager manager(active);
-    manager.create(master);
-    auto original = sample(login);
-    const auto id = original.id;
-    manager.put(std::move(original));
-    manager.put(sample(QStringLiteral("other-account")));
-    const auto version = [](const QByteArray &bytes) {
-        return qFromBigEndian<quint32>(bytes.constData() + 4);
-    };
-    check(version(storage.read()) == 1, "empty emails must use format 1");
-    manager.lock();
-    manager.open(master);
-    check(manager.data().entries[0].email.isEmpty(), "format 1 email must default to empty");
-
-    auto edited = sample(login);
-    edited.id = id;
-    edited.email = email;
-    manager.put(std::move(edited));
-    const auto upgraded = storage.read();
-    check(version(upgraded) == 2 && !upgraded.contains(email.toUtf8()), "email must use encrypted format 2");
-    manager.lock();
-    expectError(VaultError::WrongPassword, [&] { manager.open(nextMaster); });
-    manager.open(master);
-    check(manager.data().entries[0].id == id && manager.data().entries[0].login == login
-          && manager.data().entries[0].email == email && manager.data().entries[1].email.isEmpty(),
-          "format 2 round trip");
-
-    auto invalid = sample(login);
-    invalid.id = id;
-    invalid.email = QStringLiteral("missing-domain");
-    expectError(VaultError::Invalid, [&] { manager.put(std::move(invalid)); });
-    check(storage.read() == upgraded, "invalid email changed the file");
-
-    auto fakeFormat = upgraded;
-    fakeFormat[7] = char(1);
-    fakeFormat.chop(32);
-    fakeFormat += QCryptographicHash::hash(fakeFormat, QCryptographicHash::Sha256);
-    StorageManager(backup).write(fakeFormat);
-    expectError(VaultError::Damaged, [&] { manager.importFrom(backup, master); });
-
-    manager.exportTo(backup);
-    PasswordManager restored(restoredPath);
-    restored.importFrom(backup, master);
-    restored.changePassword(master, nextMaster);
-    restored.lock();
-    restored.open(nextMaster);
-    check(restored.data().entries[0].email == email, "backup or password rotation lost email");
-
-    auto cleared = sample(login);
-    cleared.id = id;
-    manager.put(std::move(cleared));
-    check(version(storage.read()) == 1, "removing the last email must restore format 1");
+    check(dir.isValid() && QDir().mkpath(dir.filePath(QStringLiteral("active"))), "rollback directory");
+    PasswordManager manager(dir.filePath(QStringLiteral("active/vault.lvault")));
+    manager.create(QStringLiteral("rollback test password"));
+    auto group = site(QStringLiteral("Сайт"), QStringLiteral("https://example.com"));
+    const auto id = group.id;
+    manager.putSite(std::move(group));
+    auto entry = account(id, QStringLiteral("retained"));
+    const auto accountId = entry.id;
+    manager.put(std::move(entry));
+    check(QDir(dir.path()).rename(QStringLiteral("active"), QStringLiteral("moved")), "rename active directory");
+    expectError(VaultError::Io, [&] { manager.put(account(id, QStringLiteral("discarded"))); });
+    expectError(VaultError::Io, [&] { manager.remove(accountId); });
+    expectError(VaultError::Io, [&] { manager.removeSite(id); });
+    expectError(VaultError::Io, [&] { manager.setIdleMinutes(19); });
+    check(manager.data().sites.size() == 1 && manager.data().sites[0].id == id
+          && manager.data().entries.size() == 1 && manager.data().entries[0].id == accountId
+          && manager.data().idleMinutes == 5, "failed write changed in-memory state");
 }
 }
 
@@ -211,9 +207,9 @@ int main(int argc, char *argv[])
     try {
         CryptoManager::initialize();
         checkVault();
-        checkOptionalEmail();
+        checkRollback();
         checkGenerator();
-        std::cout << "Vault checks passed\n";
+        std::cout << "Vault checks passed.\n";
     } catch (const Failure &failure) {
         std::cerr << failure.message.toStdString() << '\n';
         return 1;

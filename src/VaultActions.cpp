@@ -1,6 +1,12 @@
 #include "MainWindow.h"
 #include "Dialogs.h"
 
+#include <QCheckBox>
+#include <QDateTimeEdit>
+#include <QLocale>
+#include <QScrollArea>
+#include <QSignalBlocker>
+#include <algorithm>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QMessageBox>
@@ -13,90 +19,334 @@ void clearFields(std::initializer_list<QLineEdit *> fields)
     for (auto *field : fields)
         clearText(field);
 }
+
+QFormLayout *stackedForm(QVBoxLayout *layout)
+{
+    auto *form = new QFormLayout;
+    form->setRowWrapPolicy(QFormLayout::WrapAllRows);
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    form->setLabelAlignment(Qt::AlignLeft);
+    form->setVerticalSpacing(8);
+    layout->addLayout(form);
+    return form;
+}
+
+bool confirmRemoval(QWidget *parent, const QString &message)
+{
+    QMessageBox dialog(QMessageBox::Question, QStringLiteral("Подтверждение"), message,
+                       QMessageBox::Ok | QMessageBox::Cancel, parent);
+    dialog.setTextFormat(Qt::PlainText);
+    setAction(dialog.button(QMessageBox::Ok), QStringLiteral("Удалить"), "trash");
+    setAction(dialog.button(QMessageBox::Cancel), QStringLiteral("Отмена"), "x-lg");
+    dialog.setDefaultButton(QMessageBox::Cancel);
+    return dialog.exec() == QMessageBox::Ok;
+}
+
+class EmailFields {
+public:
+    EmailFields(QVBoxLayout *layout, QWidget *parent, bool readOnly)
+        : parent(parent), readOnly(readOnly)
+    {
+        auto *header = new QHBoxLayout;
+        auto *title = label(QStringLiteral("Электронные почты"), parent, "cardTitle");
+        title->setWordWrap(false);
+        header->addWidget(title);
+        header->addStretch();
+        layout->addLayout(header);
+        if (!readOnly) {
+            addButton = iconButton(header, parent, QStringLiteral("Добавить электронную почту"),
+                                   "plus-lg", [this] { add({}, {}); });
+        }
+        rows = new QVBoxLayout;
+        layout->addLayout(rows);
+    }
+
+    ~EmailFields()
+    {
+        for (const auto &row : fields)
+            clearFields({row.address, row.description});
+    }
+
+    void add(const QString &address, const QString &description)
+    {
+        if (fields.size() >= Entry::maxEmails)
+            return;
+        auto *widget = new QWidget(parent);
+        auto *layout = new QHBoxLayout(widget);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto *mail = new QLineEdit(address, widget);
+        auto *note = new QLineEdit(description, widget);
+        for (auto *field : {mail, note}) {
+            field->setMaxLength(2048);
+            field->setReadOnly(readOnly);
+        }
+        mail->setPlaceholderText(QStringLiteral("name@example.com"));
+        mail->setAccessibleName(QStringLiteral("Адрес электронной почты"));
+        note->setPlaceholderText(QStringLiteral("Например, рабочая"));
+        note->setAccessibleName(QStringLiteral("Описание почты"));
+        auto *mailColumn = new QVBoxLayout;
+        mailColumn->setSpacing(5);
+        auto *mailLabel = label(QStringLiteral("Адрес"), widget);
+        mailLabel->setBuddy(mail);
+        mailColumn->addWidget(mailLabel);
+        mailColumn->addWidget(mail);
+        layout->addLayout(mailColumn, 3);
+        auto *noteColumn = new QVBoxLayout;
+        noteColumn->setSpacing(5);
+        auto *noteLabel = label(QStringLiteral("Описание (необязательно)"), widget);
+        noteLabel->setBuddy(note);
+        noteColumn->addWidget(noteLabel);
+        noteColumn->addWidget(note);
+        layout->addLayout(noteColumn, 2);
+        fields.push_back({mail, note});
+        if (!readOnly) {
+            auto *remove = iconButton(layout, widget, QStringLiteral("Убрать адрес"), "dash-lg", [=] {
+                clearFields({mail, note});
+                const auto row = std::find_if(fields.begin(), fields.end(),
+                                              [mail](const Row &item) { return item.address == mail; });
+                fields.erase(row);
+                rows->removeWidget(widget);
+                widget->hide();
+                widget->deleteLater();
+                addButton->setEnabled(true);
+            });
+            layout->setAlignment(remove, Qt::AlignBottom);
+            addButton->setEnabled(fields.size() < Entry::maxEmails);
+        }
+        rows->addWidget(widget);
+        if (address.isEmpty())
+            mail->setFocus();
+    }
+
+    std::vector<EmailAddress> collect() const
+    {
+        std::vector<EmailAddress> result;
+        result.reserve(fields.size());
+        for (const auto &row : fields) {
+            EmailAddress email;
+            email.address = row.address->text().trimmed();
+            email.description = row.description->text().trimmed();
+            if (!email.address.isEmpty() || !email.description.isEmpty())
+                result.push_back(std::move(email));
+        }
+        return result;
+    }
+
+private:
+    struct Row { QLineEdit *address; QLineEdit *description; };
+    QWidget *parent;
+    bool readOnly;
+    QVBoxLayout *rows;
+    QPushButton *addButton = nullptr;
+    std::vector<Row> fields;
+};
+}
+
+void MainWindow::siteDialog(const Site *site)
+{
+    const auto id = site ? site->id : QUuid::createUuid();
+    QDialog dialog(this);
+    dialog.setWindowTitle(site ? QStringLiteral("Изменить сайт") : QStringLiteral("Новый сайт"));
+    dialog.setMinimumWidth(460);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(20, 20, 20, 16);
+    layout->setSpacing(12);
+    auto *form = stackedForm(layout);
+    auto *name = new QLineEdit(site ? site->name : QString{}, &dialog);
+    auto *url = new QLineEdit(site ? site->url : QString{}, &dialog);
+    name->setMaxLength(2048);
+    url->setMaxLength(2048);
+    name->setPlaceholderText(QStringLiteral("Например, GitHub"));
+    url->setPlaceholderText(QStringLiteral("https://example.com"));
+    form->addRow(QStringLiteral("Название"), name);
+    form->addRow(QStringLiteral("Адрес"), url);
+    const auto cleanup = qScopeGuard([&] { clearFields({name, url}); });
+    auto *error = label({}, &dialog, "error");
+    layout->addWidget(error);
+    auto *controls = dialogButtons(dialog, layout, QStringLiteral("Сохранить"), true);
+    connect(controls, &QDialogButtonBox::accepted, &dialog, [&] {
+        if (!manager.unlocked())
+            return;
+        Site edited;
+        edited.id = id;
+        edited.name = name->text().simplified();
+        edited.url = url->text().trimmed();
+        try {
+            manager.putSite(std::move(edited));
+            dialog.accept();
+        } catch (const Failure &failure) {
+            error->setText(failure.message);
+        }
+    });
+    if (dialog.exec() == QDialog::Accepted) {
+        const QSignalBlocker block(search);
+        clearText(search);
+        refresh(id);
+    }
+}
+
+void MainWindow::removeSite()
+{
+    if (selectedSite.isNull())
+        return;
+    const auto id = selectedSite;
+    if (!confirmRemoval(this, QStringLiteral("Удалить выбранный сайт и все его аккаунты?")) || !manager.unlocked())
+        return;
+    try {
+        manager.removeSite(id);
+        refresh();
+    } catch (const Failure &failure) {
+        showError(failure);
+    }
 }
 
 void MainWindow::entryDialog(const Entry *entry, bool readOnly)
 {
-    if (readOnly && !entry)
+    const auto siteId = entry ? entry->siteId : selectedSite;
+    if (siteId.isNull() || (readOnly && !entry))
         return;
+    const auto id = entry ? entry->id : QUuid::createUuid();
+    const bool isNew = !entry;
+    const QDateTime previousDate = entry ? entry->createdAt : QDateTime{};
     QDialog dialog(this);
     dialog.setWindowTitle(readOnly ? QStringLiteral("Данные аккаунта")
-        : entry ? QStringLiteral("Изменение записи") : QStringLiteral("Новая запись"));
-    dialog.setMinimumWidth(480);
-    auto *layout = new QVBoxLayout(&dialog);
-    auto *form = new QFormLayout;
-    layout->addLayout(form);
-    const auto add = [&](const QString &name, QLineEdit *field) {
+        : isNew ? QStringLiteral("Новый аккаунт") : QStringLiteral("Изменить аккаунт"));
+    dialog.resize(610, 635);
+    dialog.setMinimumSize(500, 390);
+    auto *outer = new QVBoxLayout(&dialog);
+    outer->setContentsMargins(20, 18, 20, 16);
+    outer->setSpacing(12);
+    auto *scroll = new QScrollArea(&dialog);
+    scroll->setWidgetResizable(true);
+    outer->addWidget(scroll, 1);
+    auto *body = new QWidget(scroll);
+    scroll->setWidget(body);
+    auto *layout = new QVBoxLayout(body);
+    layout->setContentsMargins(0, 0, 0, 4);
+    layout->setSpacing(12);
+    auto *form = stackedForm(layout);
+    const auto add = [&](const QString &name, const QString &hint, QLineEdit *field) {
         field->setMaxLength(2048);
         field->setReadOnly(readOnly);
+        if (!readOnly)
+            field->setPlaceholderText(hint);
         form->addRow(name, field);
         return field;
     };
-    if (readOnly) {
-        auto *idField = add(QStringLiteral("ID"), new QLineEdit(&dialog));
-        idField->setText(entry->id.toString(QUuid::WithoutBraces));
+    if (!isNew) {
+        auto *idField = new QLineEdit(id.toString(QUuid::WithoutBraces), body);
+        idField->setReadOnly(true);
+        form->addRow(QStringLiteral("Локальный ID"), idField);
     }
-    auto *site = add(QStringLiteral("Сайт"), new QLineEdit(&dialog));
-    auto *url = add(QStringLiteral("Адрес"), new QLineEdit(&dialog));
-    auto *login = add(QStringLiteral("Логин"), new QLineEdit(&dialog));
-    auto *email = add(readOnly ? QStringLiteral("Электронная почта")
-                               : QStringLiteral("Электронная почта (необязательно)"),
-                      new QLineEdit(&dialog));
-    auto *password = add(QStringLiteral("Пароль"), secretField(&dialog));
-    const auto cleanup = qScopeGuard([&] { clearFields({site, url, login, email, password}); });
-    url->setPlaceholderText(QStringLiteral("https://example.com"));
+    auto *login = add(QStringLiteral("Логин"), QStringLiteral("Введите логин"), new QLineEdit(body));
+    auto *password = secretField(body);
+    password->setReadOnly(readOnly);
+    password->setAccessibleName(QStringLiteral("Пароль"));
     if (!readOnly)
-        email->setPlaceholderText(QStringLiteral("name@example.com"));
-    const QUuid id = entry ? entry->id : QUuid::createUuid();
+        password->setPlaceholderText(QStringLiteral("Введите пароль"));
+    auto *passwordRow = new QHBoxLayout;
+    passwordRow->setSpacing(6);
+    passwordRow->addWidget(password, 1);
+    addReveal(passwordRow, password);
+    form->addRow(QStringLiteral("Пароль"), passwordRow);
+    const auto cleanup = qScopeGuard([&] { clearFields({login, password}); });
     if (entry) {
-        site->setText(entry->site);
-        url->setText(entry->url);
         login->setText(entry->login);
-        email->setText(entry->email);
         password->setText(entry->password);
     }
-    addReveal(layout, password);
     addStrength(layout, password);
-    auto *actions = new QHBoxLayout;
-    layout->addLayout(actions);
+    if (!readOnly) {
+        iconButton(passwordRow, body, QStringLiteral("Сгенерировать пароль"), "shuffle", [&] {
+            GeneratorDialog generator(&dialog, QStringLiteral("Использовать пароль"));
+            if (generator.exec() == QDialog::Accepted && manager.unlocked()) {
+                clearText(password);
+                QString value = generator.takePassword();
+                password->setText(value);
+                wipe(value);
+            }
+        });
+    }
+
+    layout->addWidget(label(QStringLiteral("Дополнительно"), body, "cardTitle"));
+    form = stackedForm(layout);
+    auto *userName = add(QStringLiteral("Имя пользователя"), QStringLiteral("Например, Алексей"), new QLineEdit(body));
+    auto *phone = add(QStringLiteral("Телефон"), QStringLiteral("+7 900 000-00-00"), new QLineEdit(body));
+    const auto clearAdditional = qScopeGuard([&] { clearFields({userName, phone}); });
+    if (entry) {
+        userName->setText(entry->userName);
+        phone->setText(entry->phone);
+    }
+    QCheckBox *withDate = nullptr;
+    QDateTimeEdit *date = nullptr;
+    bool dateEdited = false;
     if (readOnly) {
-        button(actions, &dialog, QStringLiteral("Копировать логин"), [&] {
+        form->addRow(QStringLiteral("Дата создания"), label(entry->createdAt.isValid()
+            ? QLocale(QLocale::Russian).toString(entry->createdAt.toLocalTime(), QLocale::ShortFormat)
+            : QStringLiteral("Не указана"), body));
+    } else {
+        withDate = new QCheckBox(QStringLiteral("Указать дату создания"), body);
+        withDate->setChecked(isNew || entry->createdAt.isValid());
+        form->addRow(withDate);
+        date = new QDateTimeEdit(body);
+        date->setDisplayFormat(QStringLiteral("dd.MM.yyyy HH:mm:ss"));
+        date->setCalendarPopup(true);
+        date->setDateTimeRange(QDateTime(QDate(1, 1, 1), QTime(0, 0)),
+                               QDateTime(QDate(9999, 12, 31), QTime(23, 59, 59)));
+        date->setDateTime(entry && entry->createdAt.isValid()
+                          ? entry->createdAt.toLocalTime() : QDateTime::currentDateTime());
+        date->setEnabled(withDate->isChecked());
+        connect(withDate, &QCheckBox::toggled, date, &QDateTimeEdit::setEnabled);
+        connect(date, &QDateTimeEdit::dateTimeChanged, &dialog, [&] { dateEdited = true; });
+        form->addRow(QStringLiteral("Дата и время"), date);
+    }
+
+    EmailFields emails(layout, body, readOnly);
+    if (entry) {
+        for (const auto &email : entry->emails)
+            emails.add(email.address, email.description);
+    }
+    if (readOnly && entry->emails.empty())
+        layout->addWidget(label(QStringLiteral("Адреса не указаны."), body));
+    layout->addStretch();
+    if (readOnly) {
+        auto *actions = new QHBoxLayout;
+        outer->addLayout(actions);
+        iconButton(actions, &dialog, QStringLiteral("Копировать логин"), "copy", [&] {
             QString value = login->text();
             copy(value);
             wipe(value);
         });
-        button(actions, &dialog, QStringLiteral("Копировать пароль"), [&] {
+        iconButton(actions, &dialog, QStringLiteral("Копировать пароль"), "key", [&] {
             QString value = password->text();
             copy(value);
             wipe(value);
         });
-        button(actions, &dialog, QStringLiteral("Закрыть"), [&] { dialog.accept(); });
+        actions->addStretch();
+        iconButton(actions, &dialog, QStringLiteral("Закрыть"), "x-lg", [&] { dialog.accept(); });
         dialog.exec();
         return;
     }
 
-    button(actions, &dialog, QStringLiteral("Сгенерировать пароль"), [&] {
-        GeneratorDialog generator(&dialog, QStringLiteral("Использовать пароль"));
-        if (generator.exec() == QDialog::Accepted && manager.unlocked()) {
-            clearText(password);
-            QString value = generator.takePassword();
-            password->setText(value);
-            wipe(value);
-        }
-    });
     auto *error = label({}, &dialog, "error");
-    layout->addWidget(error);
-    auto *buttons = dialogButtons(dialog, layout, QStringLiteral("Сохранить"));
+    outer->addWidget(error);
+    auto *buttons = dialogButtons(dialog, outer, QStringLiteral("Сохранить"), true);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (!manager.unlocked())
             return;
         Entry edited;
         edited.id = id;
-        edited.site = site->text().trimmed();
-        edited.url = url->text().trimmed();
+        edited.siteId = siteId;
         edited.login = login->text();
-        edited.email = email->text().trimmed();
         edited.password = password->text();
+        edited.userName = userName->text().trimmed();
+        edited.phone = phone->text().trimmed();
+        edited.emails = emails.collect();
+        if (!withDate->isChecked())
+            edited.createdAt = {};
+        else if (dateEdited)
+            edited.createdAt = date->dateTime().toUTC();
+        else if (previousDate.isValid())
+            edited.createdAt = previousDate;
         try {
             manager.put(std::move(edited));
             dialog.accept();
@@ -105,27 +355,18 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
         }
     });
     if (dialog.exec() == QDialog::Accepted)
-        refresh(id);
+        renderSite();
 }
 
-void MainWindow::removeEntry()
+void MainWindow::removeEntry(const QUuid &id)
 {
-    const auto *entry = selected();
-    if (!entry)
-        return;
-    const auto id = entry->id;
-    QMessageBox confirm(QMessageBox::Question, QStringLiteral("Удаление записи"),
-        QStringLiteral("Удалить выбранную запись?"), QMessageBox::Ok | QMessageBox::Cancel, this);
-    confirm.button(QMessageBox::Ok)->setText(QStringLiteral("Удалить"));
-    confirm.button(QMessageBox::Cancel)->setText(QStringLiteral("Отмена"));
-    confirm.setDefaultButton(QMessageBox::Cancel);
-    if (confirm.exec() != QMessageBox::Ok || !manager.unlocked())
+    if (!confirmRemoval(this, QStringLiteral("Удалить выбранный аккаунт?")) || !manager.unlocked())
         return;
     try {
         manager.remove(id);
-        refresh();
-    } catch (const Failure &error) {
-        showError(error);
+        renderSite();
+    } catch (const Failure &failure) {
+        showError(failure);
     }
 }
 
@@ -142,12 +383,15 @@ void MainWindow::settings()
     form->addRow(QStringLiteral("Блокировать при бездействии через"), minutes);
     layout->addLayout(form);
     constexpr int changePasswordResult = 2;
-    button(layout, &dialog, QStringLiteral("Изменить мастер-пароль"), [&] {
+    auto *actions = new QHBoxLayout;
+    layout->addLayout(actions);
+    button(actions, &dialog, QStringLiteral("Изменить мастер-пароль"), [&] {
         dialog.done(changePasswordResult);
     });
+    actions->addStretch();
     auto *error = label({}, &dialog, "error");
     layout->addWidget(error);
-    auto *buttons = dialogButtons(dialog, layout, QStringLiteral("Сохранить"));
+    auto *buttons = dialogButtons(dialog, layout, QStringLiteral("Сохранить"), true);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (!manager.unlocked())
             return;
@@ -182,7 +426,7 @@ void MainWindow::changePassword()
     auto *error = label({}, &dialog, "error");
     layout->addWidget(error);
     const auto cleanup = qScopeGuard([&] { clearFields({current, next, confirm}); });
-    auto *buttons = dialogButtons(dialog, layout, QStringLiteral("Изменить пароль"));
+    auto *buttons = dialogButtons(dialog, layout, QStringLiteral("Изменить пароль"), true);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (!manager.unlocked())
             return;
@@ -227,7 +471,7 @@ void MainWindow::importVault()
     layout->addWidget(error);
     const auto cleanup = qScopeGuard([&] { clearText(password); });
     auto *buttons = dialogButtons(dialog, layout, wasUnlocked ? QStringLiteral("Заменить хранилище")
-                                                              : QStringLiteral("Импортировать"));
+                                                              : QStringLiteral("Импортировать"), !wasUnlocked);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         if (wasUnlocked && !manager.unlocked())
             return;
@@ -243,6 +487,8 @@ void MainWindow::importVault()
     });
     if (dialog.exec() == QDialog::Accepted) {
         clearClipboard();
+        const QSignalBlocker block(search);
+        selectedSite = QUuid{};
         clearFields({search, master, repeat});
         showUnlocked();
     }

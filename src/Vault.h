@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QString>
 #include <QUuid>
 
@@ -29,13 +30,38 @@ private:
     std::unique_ptr<unsigned char, Deleter> bytes;
 };
 
-struct Entry {
+struct Site {
     QUuid id = QUuid::createUuid();
-    QString site;
+    QString name;
     QString url;
+
+    Site() = default;
+    Site(Site &&) noexcept = default;
+    Site &operator=(Site &&other) noexcept;
+    ~Site();
+};
+
+struct EmailAddress {
+    QString address;
+    QString description;
+
+    EmailAddress() = default;
+    EmailAddress(EmailAddress &&) noexcept = default;
+    EmailAddress &operator=(EmailAddress &&other) noexcept;
+    ~EmailAddress();
+};
+
+struct Entry {
+    static constexpr int maxEmails = 64;
+
+    QUuid id = QUuid::createUuid();
+    QUuid siteId;
     QString login;
     QString password;
-    QString email;
+    QString userName;
+    QString phone;
+    QDateTime createdAt = QDateTime::currentDateTimeUtc();
+    std::vector<EmailAddress> emails;
 
     Entry() = default;
     Entry(const Entry &) = delete;
@@ -46,6 +72,7 @@ struct Entry {
 };
 
 struct VaultData {
+    std::vector<Site> sites;
     std::vector<Entry> entries;
     int idleMinutes = 5;
 };
@@ -99,6 +126,8 @@ public:
     void changePassword(const QString &current, const QString &next);
     void importFrom(const QString &path, const QString &password);
     void exportTo(const QString &path) const;
+    void putSite(Site site);
+    void removeSite(const QUuid &id);
     void put(Entry entry);
     void remove(const QUuid &id);
     void setIdleMinutes(int minutes);

@@ -12,7 +12,8 @@
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("LocalVault"));
+    app.setApplicationName(QStringLiteral("LocalVault V2"));
+    app.setApplicationDisplayName(QStringLiteral("LocalVault"));
     app.setDesktopFileName(QStringLiteral("localvault"));
     app.setWindowIcon(QIcon(QStringLiteral(":/icons/localvault.png")));
     app.setStyle(QStringLiteral("Fusion"));

@@ -3,6 +3,7 @@
 /out/
 /dist/
 /app/
+/app-v2/
 /cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
