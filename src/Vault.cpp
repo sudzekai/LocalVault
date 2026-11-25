@@ -1,4 +1,5 @@
 #include "Vault.h"
+#include "RemoteFile.h"
 
 #include <QCryptographicHash>
 #include <QDataStream>
@@ -568,16 +569,50 @@ VaultData CryptoManager::decrypt(const Session &session, const QByteArray &file)
     return deserialize(payload.value, session.header.version);
 }
 
-StorageManager::StorageManager(QString path) : path(std::move(path)) {}
+StorageManager::StorageManager(QString path, QByteArray token)
+    : path(std::move(path)), apiToken(std::move(token)) {}
+
+StorageManager::~StorageManager()
+{
+    wipe(apiToken);
+}
+
+StorageManager &StorageManager::operator=(StorageManager &&other) noexcept
+{
+    path.swap(other.path);
+    apiToken.swap(other.apiToken);
+    return *this;
+}
+
+bool StorageManager::isRemoteSource(const QString &source)
+{
+    return source.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)
+        || source.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive);
+}
+
+bool StorageManager::isRemote() const
+{
+    return isRemoteSource(path);
+}
+
+void StorageManager::setToken(QByteArray token)
+{
+    wipe(apiToken);
+    apiToken = std::move(token);
+}
 
 bool StorageManager::exists() const
 {
+    if (isRemote())
+        return true;
     const QFileInfo info(path);
     return info.exists() || info.isSymLink();
 }
 
 QByteArray StorageManager::read() const
 {
+    if (isRemote())
+        return RemoteFile::read(path, apiToken);
     QFile file(path);
     if (!QFileInfo(file).isFile() || !file.open(QIODevice::ReadOnly))
         fail(VaultError::Io, QStringLiteral("Не удалось открыть файл: %1").arg(path));
@@ -591,8 +626,12 @@ QByteArray StorageManager::read() const
     return bytes;
 }
 
-void StorageManager::write(const QByteArray &bytes) const
+void StorageManager::write(const QByteArray &bytes, const QByteArray &revision) const
 {
+    if (isRemote()) {
+        RemoteFile::write(path, apiToken, bytes, revision);
+        return;
+    }
     QSaveFile file(path);
     file.setDirectWriteFallback(false);
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
@@ -639,18 +678,18 @@ Session AuthManager::unlock(const QByteArray &file, const QString &password)
 
 PasswordManager::PasswordManager(QString path) : storage(path), activePath(std::move(path)) {}
 
-void PasswordManager::selectPath(QString path, bool custom)
+void PasswordManager::selectPath(QString path, bool custom, QByteArray token)
 {
     if (unlocked())
         fail(VaultError::Invalid, QStringLiteral("Заблокируйте хранилище, чтобы изменить путь."));
-    storage = StorageManager(path);
+    storage = StorageManager(path, std::move(token));
     activePath = std::move(path);
     customPath = custom;
 }
 
 void PasswordManager::checkAvailability() const
 {
-    if (customPath && !QFileInfo(activePath).isFile())
+    if (customPath && !isRemote() && !QFileInfo(activePath).isFile())
         fail(VaultError::Io, QStringLiteral("Файл хранилища по выбранному пути недоступен. Проверьте путь в настройках."));
 }
 
@@ -736,6 +775,8 @@ void PasswordManager::importFrom(const QString &path, const QString &password)
 void PasswordManager::exportTo(const QString &path) const
 {
     const auto &current = activeSession();
+    if (StorageManager::isRemoteSource(path))
+        fail(VaultError::Invalid, QStringLiteral("Для экспорта выберите локальный файл."));
     if (comparablePath(path).compare(comparablePath(activePath),
 #ifdef Q_OS_WIN
             Qt::CaseInsensitive
@@ -760,6 +801,8 @@ const Session &PasswordManager::activeSession() const
 std::unique_ptr<QLockFile> PasswordManager::acquireAccess() const
 {
     checkAvailability();
+    if (isRemote())
+        return {};
     auto fileAccess = std::make_unique<QLockFile>(comparablePath(activePath) + QStringLiteral(".lock"));
     fileAccess->setStaleLockTime(0);
     if (!fileAccess->tryLock(0))
@@ -780,12 +823,12 @@ QByteArray PasswordManager::readCurrentFile() const
 
 void PasswordManager::commitFile(const QByteArray &file)
 {
-    if (!revision.isEmpty())
+    if (!revision.isEmpty() && !isRemote())
         readCurrentFile();
-    else if (storage.exists())
+    else if (revision.isEmpty() && storage.exists())
         fail(VaultError::Io, QStringLiteral("Хранилище уже существует."));
     const auto nextRevision = QCryptographicHash::hash(file, QCryptographicHash::Sha256);
-    storage.write(file);
+    storage.write(file, revision);
     revision = nextRevision;
 }
 

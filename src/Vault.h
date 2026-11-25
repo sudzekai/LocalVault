@@ -119,14 +119,23 @@ public:
 
 class StorageManager {
 public:
-    explicit StorageManager(QString path);
+    explicit StorageManager(QString path, QByteArray token = {});
+    ~StorageManager();
+    StorageManager(StorageManager &&) noexcept = default;
+    StorageManager &operator=(StorageManager &&other) noexcept;
+    StorageManager(const StorageManager &) = delete;
+    StorageManager &operator=(const StorageManager &) = delete;
+    static bool isRemoteSource(const QString &source);
+    bool isRemote() const;
+    void setToken(QByteArray token);
     bool exists() const;
     QByteArray read() const;
-    void write(const QByteArray &bytes) const;
+    void write(const QByteArray &bytes, const QByteArray &revision = {}) const;
     static VaultHeader readHeader(const QByteArray &file);
 
 private:
     QString path;
+    QByteArray apiToken;
 };
 
 class AuthManager {
@@ -138,7 +147,9 @@ public:
 class PasswordManager {
 public:
     explicit PasswordManager(QString path);
-    void selectPath(QString path, bool custom);
+    void selectPath(QString path, bool custom, QByteArray token = {});
+    bool isRemote() const { return storage.isRemote(); }
+    void setApiToken(QByteArray token) { storage.setToken(std::move(token)); }
     const QString &path() const { return activePath; }
     bool usesCustomPath() const { return customPath; }
     void checkAvailability() const;

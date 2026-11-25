@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 #include "Dialogs.h"
 #include "IconPicker.h"
+#include "RemoteFile.h"
+#include "TokenStore.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -66,7 +68,8 @@ MainWindow::MainWindow(const QString &path)
 {
     QSettings location(locationSettingsPath, QSettings::IniFormat);
     const auto customPath = location.value(QStringLiteral("vaultPath")).toString();
-    if (location.status() != QSettings::NoError || (!customPath.isEmpty() && !QDir::isAbsolutePath(customPath)))
+    if (location.status() != QSettings::NoError
+        || (!customPath.isEmpty() && !StorageManager::isRemoteSource(customPath) && !QDir::isAbsolutePath(customPath)))
         locationError = QStringLiteral("Не удалось прочитать сохранённый путь. Выберите файл или сбросьте путь в настройках.");
     else if (!customPath.isEmpty())
         manager.selectPath(customPath, true);
@@ -132,7 +135,7 @@ MainWindow::MainWindow(const QString &path)
     lockedPage = new QWidget(pages);
     auto *lockedLayout = new QVBoxLayout(lockedPage);
     auto *card = new QWidget(lockedPage);
-    card->setFixedWidth(470);
+    card->setFixedWidth(510);
     auto *auth = new QVBoxLayout(card);
     auth->setSpacing(12);
     authTitle = label({}, card, "heading");
@@ -142,7 +145,22 @@ MainWindow::MainWindow(const QString &path)
     master->setPlaceholderText(QStringLiteral("Мастер-пароль"));
     repeat = secretField(card, 1024);
     repeat->setPlaceholderText(QStringLiteral("Повторите мастер-пароль"));
-    for (auto *widget : QList<QWidget *>{authTitle, authHint, master, repeat, authError})
+    apiTokenField = secretField(card, 1024);
+    apiTokenField->setPlaceholderText(QStringLiteral("API-токен сервера"));
+    apiTokenField->setAccessibleName(QStringLiteral("API-токен сервера"));
+    QString tokenError;
+    if (manager.isRemote()) {
+        try {
+            auto token = TokenStore::restore(location.value(QStringLiteral("apiTokenProtected")).toByteArray(),
+                                            locationSettingsPath + '\n' + manager.path());
+            apiTokenField->setText(QString::fromUtf8(token));
+            manager.setApiToken(token);
+            wipe(token);
+        } catch (const Failure &failure) {
+            tokenError = failure.message;
+        }
+    }
+    for (auto *widget : QList<QWidget *>{authTitle, authHint, apiTokenField, master, repeat, authError})
         auth->addWidget(widget);
     auto *authRow = new QHBoxLayout;
     auth->addLayout(authRow);
@@ -152,12 +170,31 @@ MainWindow::MainWindow(const QString &path)
         QString again = takeText(repeat);
         const auto cleanup = qScopeGuard([&] { wipe(password); wipe(again); });
         try {
+            if (manager.isRemote()) {
+                QString token = apiTokenField->text();
+                manager.setApiToken(token.toUtf8());
+                wipe(token);
+            }
             if (manager.usesCustomPath() || manager.exists()) {
                 manager.open(password);
             } else {
                 if (password != again)
                     throw Failure{VaultError::Invalid, QStringLiteral("Мастер-пароли не совпадают.")};
                 manager.create(password);
+            }
+            if (manager.isRemote()) {
+                QString token = apiTokenField->text();
+                const auto cleanupToken = qScopeGuard([&] { wipe(token); });
+                QSettings settings(locationSettingsPath, QSettings::IniFormat);
+                try {
+                    settings.setValue(QStringLiteral("apiTokenProtected"), TokenStore::protect(token.toUtf8(), locationSettingsPath + '\n' + manager.path()));
+                    settings.sync();
+                    if (settings.status() != QSettings::NoError)
+                        throw Failure{VaultError::Io, QStringLiteral("Не удалось сохранить API-токен.")};
+                } catch (...) {
+                    manager.lock();
+                    throw;
+                }
             }
             showUnlocked();
         } catch (const Failure &failure) {
@@ -300,6 +337,8 @@ MainWindow::MainWindow(const QString &path)
 
     idleTimer.setInterval(500);
     connect(&idleTimer, &QTimer::timeout, this, [this] {
+        if (RemoteFile::requestActive())
+            return;
         if (activity.elapsed() >= qint64(manager.data().idleMinutes) * 60000)
             lock();
     });
@@ -307,6 +346,8 @@ MainWindow::MainWindow(const QString &path)
     connect(&clipboardTimer, &QTimer::timeout, this, [this] { clearClipboard(); });
     qApp->installEventFilter(this);
     showLocked();
+    if (!tokenError.isEmpty())
+        authError->setText(tokenError + QStringLiteral(" Введите токен заново."));
 }
 
 MainWindow::~MainWindow()
@@ -315,6 +356,7 @@ MainWindow::~MainWindow()
     clearClipboard();
     clearText(master);
     clearText(repeat);
+    clearText(apiTokenField);
     lock();
 }
 
@@ -341,6 +383,9 @@ void MainWindow::showLocked()
     authTitle->setText(existing ? QStringLiteral("Хранилище заблокировано") : QStringLiteral("Создайте хранилище"));
     authHint->setText(existing ? QStringLiteral("Введите мастер-пароль, чтобы открыть записи.")
                                : QStringLiteral("Установите мастер-пароль длиной не менее 12 символов."));
+    if (manager.isRemote())
+        authHint->setText(QStringLiteral("Введите API-токен сервера и мастер-пароль хранилища."));
+    apiTokenField->setVisible(manager.isRemote());
     authButton->setText(existing ? QStringLiteral("Разблокировать") : QStringLiteral("Создать"));
     authButton->setEnabled(locationError.isEmpty());
     repeat->setVisible(!existing);

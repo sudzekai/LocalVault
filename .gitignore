@@ -5,6 +5,7 @@
 /app/
 /app-v2/
 /app-v3/
+/app-v3.1*/
 /cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -50,3 +51,8 @@ ui_*.h
 *.lvault.*
 *.lvault~
 vault.lock
+vault-location.ini
+vault-location.ini.*
+/server/bin/
+/server/data/
+/server/credentials.json

@@ -24,7 +24,7 @@ protected:
 
 private:
     void vaultLocationDialog();
-    void saveVaultLocation(const QString &customPath);
+    void saveVaultLocation(const QString &customPath, QByteArray token = {});
     void showLocked();
     void showUnlocked();
     void lock();
@@ -65,6 +65,7 @@ private:
     QLabel *authError;
     QLineEdit *master;
     QLineEdit *repeat;
+    QLineEdit *apiTokenField;
     QPushButton *authButton;
     QLineEdit *search;
     QWidget *sidebar;

@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "IconPicker.h"
+#include "TokenStore.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -8,6 +9,7 @@
 #include <QDialog>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -343,7 +345,7 @@ void checkSavedPath(const QString &defaultPath, const QString &externalPath)
         window.show();
         QApplication::processEvents();
         interact(window, QStringLiteral("Настройки"), [&](QDialog &dialog) {
-            auto *path = field(dialog, QStringLiteral("Абсолютный путь к файлу .lvault"));
+            auto *path = field(dialog, QStringLiteral("Путь к .lvault или https://сервер/vault"));
             path->setText(externalPath + QStringLiteral(".missing.lvault"));
             textButton(dialog, QStringLiteral("Сохранить"))->click();
             check(dialog.isVisible(), "invalid selection closed settings");
@@ -373,7 +375,7 @@ void checkSavedPath(const QString &defaultPath, const QString &externalPath)
               "missing selected file did not show an error");
         check(!QFile::exists(defaultPath) && !QFile::exists(externalPath), "missing path created a file");
         interact(window, QStringLiteral("Настройки"), [&](QDialog &dialog) {
-            auto *path = field(dialog, QStringLiteral("Абсолютный путь к файлу .lvault"));
+            auto *path = field(dialog, QStringLiteral("Путь к .lvault или https://сервер/vault"));
             check(QDir::fromNativeSeparators(path->text()) == externalPath, "missing path was forgotten");
             textButton(dialog, QStringLiteral("Сбросить путь"))->click();
             check(dialog.result() == QDialog::Accepted, "reset didn't close settings");
@@ -552,6 +554,49 @@ void checkIconPicker()
     picker.click();
     check(chosen && picker.selectedName() == QStringLiteral("telegram"), "icon search or selection failed");
 }
+
+void checkRemoteSourceUi(const QString &defaultPath)
+{
+    const auto url = qEnvironmentVariable("APPVAULT_TEST_URL");
+    const auto token = qgetenv("APPVAULT_TEST_TOKEN");
+    const auto password = QStringLiteral("synthetic migration master");
+    {
+        MainWindow window(defaultPath);
+        window.show();
+        QApplication::processEvents();
+        interact(window, QStringLiteral("Настройки"), [&](QDialog &dialog) {
+            field(dialog, QStringLiteral("Путь к .lvault или https://сервер/vault"))->setText(url);
+            auto *secret = field(dialog, QStringLiteral("API-токен сервера"));
+            check(secret->echoMode() == QLineEdit::Password, "API token is not masked");
+            secret->setText(QString::fromUtf8(token));
+            textButton(dialog, QStringLiteral("Сохранить"))->click();
+            check(dialog.result() == QDialog::Accepted, "remote source settings were not accepted");
+        });
+        field(window, QStringLiteral("Мастер-пароль"))->setText(password);
+        textButton(window, QStringLiteral("Разблокировать"))->click();
+        check(window.findChild<QTreeWidget *>()->isVisible(), "remote UI did not unlock");
+        addSite(window, QStringLiteral("UI remote fixture"), QStringLiteral("https://ui-remote.example"));
+        const auto bytes = StorageManager(url, token).read();
+        const auto session = AuthManager::unlock(bytes, password);
+        const auto data = CryptoManager::decrypt(session, bytes);
+        check(data.sites.size() == 2, "UI save was not immediately posted");
+    }
+    const auto settingsPath = QFileInfo(defaultPath).absoluteDir().filePath(QStringLiteral("vault-location.ini"));
+    QFile settingsFile(settingsPath);
+    check(settingsFile.open(QIODevice::ReadOnly), "source settings missing");
+    const auto settings = settingsFile.readAll();
+    settingsFile.close();
+    check(!settings.contains(token), "API token was written to settings in plaintext");
+    MainWindow restarted(defaultPath);
+    restarted.show();
+    QApplication::processEvents();
+    check(field(restarted, QStringLiteral("API-токен сервера"))->text() == QString::fromUtf8(token),
+          "API token was not restored after restart");
+    field(restarted, QStringLiteral("Мастер-пароль"))->setText(password);
+    textButton(restarted, QStringLiteral("Разблокировать"))->click();
+    check(restarted.findChild<QTreeWidget *>()->isVisible(), "restored token did not unlock remote vault");
+    check(!QFile::exists(defaultPath), "URL source created a local vault");
+}
 }
 
 int main(int argc, char *argv[])
@@ -562,6 +607,16 @@ int main(int argc, char *argv[])
     try {
         check(directory.isValid(), "temporary directory");
         CryptoManager::initialize();
+#ifdef Q_OS_WIN
+        const QByteArray sampleToken("synthetic-api-token-never-used-on-server");
+        const auto protectedToken = TokenStore::protect(sampleToken, QStringLiteral("test-source"));
+        check(!protectedToken.contains(sampleToken), "protected token contains plaintext");
+        check(TokenStore::restore(protectedToken, QStringLiteral("test-source")) == sampleToken, "token roundtrip");
+        bool rejected = false;
+        try { TokenStore::restore(protectedToken, QStringLiteral("different-source")); }
+        catch (const Failure &) { rejected = true; }
+        check(rejected, "token from another source was accepted");
+#endif
         if (app.arguments().contains(QStringLiteral("--idle")))
             checkIdle(directory.filePath(QStringLiteral("idle.lvault")));
         else {
@@ -570,6 +625,8 @@ int main(int argc, char *argv[])
                            directory.filePath(QStringLiteral("external.lvault")));
             checkNewFeatures(directory.filePath(QStringLiteral("groups.lvault")));
             checkIconPicker();
+            if (!qEnvironmentVariable("APPVAULT_TEST_URL").isEmpty())
+                checkRemoteSourceUi(directory.filePath(QStringLiteral("remote-unused.lvault")));
         }
         std::cout << "Widget checks passed.\n";
     } catch (const Failure &failure) {

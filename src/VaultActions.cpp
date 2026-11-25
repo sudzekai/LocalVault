@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "Dialogs.h"
 #include "IconPicker.h"
+#include "TokenStore.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -618,32 +619,42 @@ void MainWindow::changePassword()
     dialog.exec();
 }
 
-void MainWindow::saveVaultLocation(const QString &customPath)
+void MainWindow::saveVaultLocation(const QString &customPath, QByteArray token)
 {
     QSettings location(locationSettingsPath, QSettings::IniFormat);
+    const auto previousPath = location.value(QStringLiteral("vaultPath")).toString();
+    const auto previousToken = location.value(QStringLiteral("apiTokenProtected")).toByteArray();
+    const auto protectedToken = StorageManager::isRemoteSource(customPath)
+        ? TokenStore::protect(token, locationSettingsPath + '\n' + customPath) : QByteArray{};
     if (customPath.isEmpty())
         location.remove(QStringLiteral("vaultPath"));
     else
         location.setValue(QStringLiteral("vaultPath"), customPath);
+    if (protectedToken.isEmpty())
+        location.remove(QStringLiteral("apiTokenProtected"));
+    else
+        location.setValue(QStringLiteral("apiTokenProtected"), protectedToken);
     location.sync();
     if (location.status() != QSettings::NoError)
         throw Failure{VaultError::Io, QStringLiteral("Не удалось сохранить настройки пути.")};
 
-    manager.selectPath(customPath.isEmpty() ? defaultVaultPath : customPath, !customPath.isEmpty());
+    if (previousPath != customPath)
+        TokenStore::remove(previousToken, locationSettingsPath + '\n' + previousPath);
+    manager.selectPath(customPath.isEmpty() ? defaultVaultPath : customPath, !customPath.isEmpty(), std::move(token));
     locationError.clear();
 }
 
 void MainWindow::vaultLocationDialog()
 {
     QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("Путь к хранилищу"));
+    dialog.setWindowTitle(QStringLiteral("Источник хранилища"));
     dialog.setMinimumWidth(570);
     auto *layout = new QVBoxLayout(&dialog);
     layout->setContentsMargins(20, 18, 20, 16);
     layout->setSpacing(12);
     auto *form = stackedForm(layout);
-    auto *path = new QLineEdit(QDir::toNativeSeparators(manager.path()), &dialog);
-    path->setPlaceholderText(QStringLiteral("Абсолютный путь к файлу .lvault"));
+    auto *path = new QLineEdit(manager.isRemote() ? manager.path() : QDir::toNativeSeparators(manager.path()), &dialog);
+    path->setPlaceholderText(QStringLiteral("Путь к .lvault или https://сервер/vault"));
     auto *row = new QHBoxLayout;
     row->setSpacing(8);
     row->addWidget(path, 1);
@@ -653,7 +664,13 @@ void MainWindow::vaultLocationDialog()
         if (!chosen.isEmpty())
             path->setText(QDir::toNativeSeparators(chosen));
     });
-    form->addRow(QStringLiteral("Файл хранилища"), row);
+    form->addRow(QStringLiteral("Источник"), row);
+    auto *token = secretField(&dialog, 1024);
+    token->setPlaceholderText(QStringLiteral("API-токен сервера"));
+    token->setText(apiTokenField->text());
+    form->addRow(QStringLiteral("API-токен (для URL)"), token);
+    const auto clearToken = qScopeGuard([&] { clearText(token); });
+    layout->addWidget(label(QStringLiteral("Для удалённого доступа используйте HTTPS. API-токен запоминается с защитой средствами ОС."), &dialog));
     layout->addWidget(label(QStringLiteral("По умолчанию: %1").arg(QDir::toNativeSeparators(defaultVaultPath)), &dialog));
     auto *error = label({}, &dialog, "error");
     layout->addWidget(error);
@@ -661,13 +678,24 @@ void MainWindow::vaultLocationDialog()
     const auto apply = [&](const QString &customPath) {
         try {
             if (!customPath.isEmpty()) {
-                const QFileInfo file(customPath);
-                if (!QDir::isAbsolutePath(customPath) || !file.isFile()
-                    || file.suffix().compare(QStringLiteral("lvault"), Qt::CaseInsensitive) != 0)
-                    throw Failure{VaultError::Invalid, QStringLiteral("Укажите полный путь к существующему файлу .lvault.")};
-                StorageManager::readHeader(StorageManager(customPath).read());
+                if (StorageManager::isRemoteSource(customPath)) {
+                    QString secret = token->text();
+                    const auto clearSecret = qScopeGuard([&] { wipe(secret); });
+                    StorageManager::readHeader(StorageManager(customPath, secret.toUtf8()).read());
+                } else {
+                    const QFileInfo file(customPath);
+                    if (!QDir::isAbsolutePath(customPath) || !file.isFile()
+                        || file.suffix().compare(QStringLiteral("lvault"), Qt::CaseInsensitive) != 0)
+                        throw Failure{VaultError::Invalid, QStringLiteral("Укажите полный путь к существующему файлу .lvault или URL сервера.")};
+                    StorageManager::readHeader(StorageManager(customPath).read());
+                }
             }
-            saveVaultLocation(customPath);
+            QString secret = token->text();
+            const auto clearSecret = qScopeGuard([&] { wipe(secret); });
+            saveVaultLocation(customPath, StorageManager::isRemoteSource(customPath) ? secret.toUtf8() : QByteArray{});
+            clearText(apiTokenField);
+            if (StorageManager::isRemoteSource(customPath))
+                apiTokenField->setText(secret);
             dialog.accept();
         } catch (const Failure &failure) {
             error->setText(failure.message);
@@ -685,7 +713,7 @@ void MainWindow::vaultLocationDialog()
             error->setText(QStringLiteral("Укажите путь к файлу или нажмите «Сбросить путь»."));
             return;
         }
-        apply(QDir::cleanPath(QDir::fromNativeSeparators(entered)));
+        apply(StorageManager::isRemoteSource(entered) ? entered : QDir::cleanPath(QDir::fromNativeSeparators(entered)));
     });
 
     if (dialog.exec() == QDialog::Accepted) {
