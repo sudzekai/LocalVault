@@ -31,10 +31,23 @@ private:
     std::unique_ptr<unsigned char, Deleter> bytes;
 };
 
+struct Group {
+    QUuid id = QUuid::createUuid();
+    QString name;
+    QString iconName;
+
+    Group() = default;
+    Group(Group &&) noexcept = default;
+    Group &operator=(Group &&other) noexcept;
+    ~Group();
+};
+
 struct Site {
     QUuid id = QUuid::createUuid();
     QString name;
     QString url;
+    QUuid groupId;
+    QString iconName;
 
     Site() = default;
     Site(Site &&) noexcept = default;
@@ -54,11 +67,15 @@ struct EmailAddress {
 
 struct Entry {
     static constexpr int maxEmails = 64;
+    static constexpr int maxRecoveryCodesLength = 16384;
 
     QUuid id = QUuid::createUuid();
     QUuid siteId;
     QString login;
     QString password;
+    bool alternativeSignIn = false;
+    QString signInMethod;
+    QString recoveryCodes;
     QString userName;
     QString phone;
     QDateTime createdAt = QDateTime::currentDateTimeUtc();
@@ -73,12 +90,14 @@ struct Entry {
 };
 
 struct VaultData {
+    std::vector<Group> groups;
     std::vector<Site> sites;
     std::vector<Entry> entries;
     int idleMinutes = 5;
 };
 
 struct VaultHeader {
+    quint32 version = 4;
     QByteArray salt;
     quint32 operations = 3;
     quint32 memoryKiB = 64 * 1024;
@@ -131,6 +150,8 @@ public:
     void changePassword(const QString &current, const QString &next);
     void importFrom(const QString &path, const QString &password);
     void exportTo(const QString &path) const;
+    void putGroup(Group group);
+    void removeGroup(const QUuid &id);
     void putSite(Site site);
     void removeSite(const QUuid &id);
     void put(Entry entry);

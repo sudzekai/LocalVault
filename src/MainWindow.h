@@ -4,12 +4,14 @@
 #include <QElapsedTimer>
 #include <QMainWindow>
 #include <QTimer>
+#include <QSet>
 
 class QLabel;
 class QLineEdit;
 class QPushButton;
 class QStackedWidget;
-class QListWidget;
+class QTreeWidget;
+class QTreeWidgetItem;
 class QScrollArea;
 
 class MainWindow : public QMainWindow {
@@ -31,6 +33,10 @@ private:
     const Site *currentSite() const;
     const Entry *account(const QUuid &id) const;
     void siteDialog(const Site *site = nullptr);
+    void groupDialog(bool edit = false);
+    void removeGroup();
+    void sidebarMenu(const QPoint &position, QTreeWidgetItem *item);
+    void createSiteInGroup(const QUuid &groupId);
     void removeSite();
     void entryDialog(const Entry *entry, bool readOnly = false);
     void removeEntry(const QUuid &id);
@@ -61,7 +67,10 @@ private:
     QLineEdit *repeat;
     QPushButton *authButton;
     QLineEdit *search;
-    QListWidget *sites;
+    QWidget *sidebar;
+    QTreeWidget *sites;
+    QUuid selectedGroup;
+    QSet<QUuid> expandedGroups;
     QScrollArea *cards;
     QLabel *siteTitle;
     QLabel *siteAddress;

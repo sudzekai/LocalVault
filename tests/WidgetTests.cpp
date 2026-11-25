@@ -1,14 +1,21 @@
 #include "MainWindow.h"
+#include "IconPicker.h"
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListWidget>
+#include <QTreeWidget>
+#include <QMouseEvent>
+#include <QListView>
+#include <QMenu>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -91,7 +98,7 @@ void interact(MainWindow &window, const QString &title, Function operation)
 {
     std::exception_ptr error;
     bool observed = false;
-    QTimer::singleShot(0, &window, [&] {
+    const auto fillForm = [&] {
         auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
         if (!dialog)
             return;
@@ -102,11 +109,53 @@ void interact(MainWindow &window, const QString &title, Function operation)
             error = std::current_exception();
             dialog->reject();
         }
+    };
+    QTimer::singleShot(0, &window, [&] {
+        if (auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget())) {
+            if (title == QStringLiteral("Создать группу")) {
+                bool hasSiteAction = false;
+                for (auto *entry : menu->actions())
+                    hasSiteAction |= entry->text() == QStringLiteral("Добавить сайт");
+                if (!hasSiteAction) {
+                    error = std::make_exception_ptr(std::runtime_error("empty-area menu is missing site creation"));
+                    menu->close();
+                    return;
+                }
+            }
+            for (auto *action : menu->actions()) {
+                if (action->text() == title) {
+                    QTimer::singleShot(0, &window, fillForm);
+                    menu->close();
+                    action->trigger();
+                    return;
+                }
+            }
+            menu->close();
+        } else {
+            fillForm();
+        }
     });
     if (findButton(window, title))
         click(window, title);
-    else
+    else if (title == QStringLiteral("Добавить сайт")) {
+        auto *tree = window.findChild<QTreeWidget *>();
+        check(tree, "site navigation missing");
+        auto *item = tree->currentItem();
+        if (item && item->parent())
+            item = item->parent();
+        if (item && !item->data(0, Qt::UserRole + 1).toBool())
+            item = nullptr;
+        const auto point = item ? tree->visualItemRect(item).center()
+            : QPoint(70, tree->viewport()->height() - 5);
+        tree->customContextMenuRequested(point);
+    } else if (title == QStringLiteral("Создать группу") || title == QStringLiteral("Изменить группу")) {
+        auto *tree = window.findChild<QTreeWidget *>();
+        const auto point = title == QStringLiteral("Изменить группу")
+            ? tree->visualItemRect(tree->currentItem()).center() : QPoint(70, tree->viewport()->height() - 5);
+        tree->customContextMenuRequested(point);
+    } else {
         textButton(window, title)->click();
+    }
     if (error)
         std::rethrow_exception(error);
     check(observed, "expected a modal form");
@@ -193,8 +242,8 @@ void checkUi(const QString &path)
     field(window, QStringLiteral("Повторите мастер-пароль"))->setText(password);
     textButton(window, QStringLiteral("Импортировать копию"));
     textButton(window, QStringLiteral("Создать"))->click();
-    auto *sites = window.findChild<QListWidget *>();
-    check(sites && sites->isVisible() && sites->count() == 0, "setup did not open the empty vault");
+    auto *sites = window.findChild<QTreeWidget *>();
+    check(sites && sites->isVisible() && sites->topLevelItemCount() == 0, "setup did not open the empty vault");
     interact(window, QStringLiteral("Настройки"), [](QDialog &dialog) {
         checkFooter(dialog);
         textButton(dialog, QStringLiteral("Изменить мастер-пароль"));
@@ -206,8 +255,8 @@ void checkUi(const QString &path)
     addSite(window, QStringLiteral("Alpha"), QStringLiteral("https://alpha.example"));
     addAccount(window, QStringLiteral("alpha-first"), true);
     addAccount(window, QStringLiteral("alpha-second"), false);
-    check(sites->count() == 2 && sites->item(0)->text() == QStringLiteral("Alpha")
-          && sites->item(1)->text() == QStringLiteral("Zebra"), "sites not unique or sorted");
+    check(sites->topLevelItemCount() == 2 && sites->topLevelItem(0)->text(0) == QStringLiteral("Alpha")
+          && sites->topLevelItem(1)->text(0) == QStringLiteral("Zebra"), "sites not unique or sorted");
     check(countCards(window) == 2, "selected site did not show both cards");
     const auto screenshot = qEnvironmentVariable("LOCALVAULT_TEST_SCREENSHOT");
     if (!screenshot.isEmpty())
@@ -223,24 +272,24 @@ void checkUi(const QString &path)
         click(dialog, QStringLiteral("Закрыть"));
     });
 
-    sites->setCurrentRow(1);
+    sites->setCurrentItem(sites->topLevelItem(1));
     QApplication::processEvents();
     check(countCards(window) == 1, "switching sites did not change account cards");
     auto *search = field(window, QStringLiteral("Поиск по названию"));
     search->setText(QStringLiteral("alpha-first"));
-    check(sites->count() == 0 && countCards(window) == 0, "search matched account instead of site");
+    check(sites->topLevelItemCount() == 0 && countCards(window) == 0, "search matched account instead of site");
     search->setText(QStringLiteral("ALPH"));
     QApplication::processEvents();
-    check(sites->count() == 1 && countCards(window) == 2, "search did not match site name");
+    check(sites->topLevelItemCount() == 1 && countCards(window) == 2, "search did not match site name");
     click(window, QStringLiteral("Заблокировать"));
-    check(!sites->isVisible() && sites->count() == 0 && countCards(window) == 0, "lock did not clear the UI");
+    check(!sites->isVisible() && sites->topLevelItemCount() == 0 && countCards(window) == 0, "lock did not clear the UI");
     check(QApplication::clipboard()->text().isEmpty(), "lock did not clear the clipboard");
     master->setText(QStringLiteral("wrong"));
     textButton(window, QStringLiteral("Разблокировать"))->click();
     check(!sites->isVisible(), "wrong password opened the UI");
     master->setText(password);
     textButton(window, QStringLiteral("Разблокировать"))->click();
-    check(sites->isVisible() && sites->count() == 2 && search->text().isEmpty(), "reopen failed");
+    check(sites->isVisible() && sites->topLevelItemCount() == 2 && search->text().isEmpty(), "reopen failed");
 
     click(window, QStringLiteral("Заблокировать"));
     PasswordManager verification(path);
@@ -270,7 +319,7 @@ void checkIdle(const QString &path)
     QApplication::processEvents();
     field(window, QStringLiteral("Мастер-пароль"))->setText(password);
     textButton(window, QStringLiteral("Разблокировать"))->click();
-    auto *sites = window.findChild<QListWidget *>();
+    auto *sites = window.findChild<QTreeWidget *>();
     check(sites && sites->isVisible(), "idle test could not unlock");
     QEventLoop wait;
     QTimer::singleShot(63000, &wait, &QEventLoop::quit);
@@ -310,7 +359,7 @@ void checkSavedPath(const QString &defaultPath, const QString &externalPath)
         QApplication::processEvents();
         field(window, QStringLiteral("Мастер-пароль"))->setText(masterPassword);
         textButton(window, QStringLiteral("Разблокировать"))->click();
-        check(window.findChild<QListWidget *>()->isVisible(), "path was not loaded on restart");
+        check(window.findChild<QTreeWidget *>()->isVisible(), "path was not loaded on restart");
         check(!QFile::exists(defaultPath), "external unlock created the default file");
     }
     check(QFile::rename(externalPath, externalPath + QStringLiteral(".offline")), "external test rename failed");
@@ -336,6 +385,173 @@ void checkSavedPath(const QString &defaultPath, const QString &externalPath)
     QApplication::processEvents();
     textButton(window, QStringLiteral("Создать"));
 }
+
+void checkNewFeatures(const QString &path)
+{
+    const auto password = QStringLiteral("groups widget master password");
+    MainWindow window(path);
+    window.show();
+    QApplication::processEvents();
+    field(window, QStringLiteral("Мастер-пароль"))->setText(password);
+    field(window, QStringLiteral("Повторите мастер-пароль"))->setText(password);
+    textButton(window, QStringLiteral("Создать"))->click();
+    interact(window, QStringLiteral("Создать группу"), [&](QDialog &dialog) {
+        formField(dialog, QStringLiteral("Название группы"))->setText(QStringLiteral("СОЦСЕТИ"));
+        textButton(dialog, QStringLiteral("Сохранить"))->click();
+    });
+    auto *sites = window.findChild<QTreeWidget *>();
+    check(sites && sites->topLevelItemCount() == 1
+          && sites->topLevelItem(0)->text(0) == QStringLiteral("СОЦСЕТИ"), "group missing from site tree");
+    addSite(window, QStringLiteral("Telegram"), QStringLiteral("https://telegram.org"));
+    auto *group = sites->topLevelItem(0);
+    check(group->text(0) == QStringLiteral("СОЦСЕТИ") && group->childCount() == 1
+          && group->child(0)->text(0) == QStringLiteral("Telegram"), "site not created under current group");
+    interact(window, QStringLiteral("Добавить аккаунт"), [&](QDialog &dialog) {
+        formField(dialog, QStringLiteral("Логин"))->setText(QStringLiteral("oauth-account"));
+        auto *passwordField = formField(dialog, QStringLiteral("Пароль"));
+        check(passwordField->text().isEmpty(), "new password must be empty");
+        for (auto *box : dialog.findChildren<QCheckBox *>()) {
+            if (box->text() == QStringLiteral("Альтернативный способ входа"))
+                box->setChecked(true);
+        }
+        auto *method = formField(dialog, QStringLiteral("Способ входа"));
+        check(method->isEnabled(), "alternative method is not enabled");
+        method->setText(QStringLiteral("OAuth через Google"));
+        auto *codes = dialog.findChild<QPlainTextEdit *>();
+        check(codes && codes->isHidden(), "recovery codes must initially be hidden");
+        click(dialog, QStringLiteral("Показать коды восстановления"));
+        check(codes->isVisible(), "recovery editor did not open");
+        codes->setPlainText(QStringLiteral("TEST-CODE-ONE\nTEST-CODE-TWO"));
+        textButton(dialog, QStringLiteral("Сохранить"))->click();
+        check(dialog.result() == QDialog::Accepted, "passwordless account not saved");
+    });
+    auto *copyPassword = findButton(window, QStringLiteral("Копировать пароль"));
+    check(copyPassword && !copyPassword->isEnabled(), "empty password copy is enabled");
+    const auto treePreview = qEnvironmentVariable("LOCALVAULT_TREE_PREVIEW");
+    if (!treePreview.isEmpty())
+        check(window.grab().save(treePreview), "could not save group tree preview");
+    interact(window, QStringLiteral("Просмотр аккаунта"), [&](QDialog &dialog) {
+        auto *codes = dialog.findChild<QPlainTextEdit *>();
+        check(codes && codes->isHidden() && codes->isReadOnly(), "saved codes are not masked/read-only");
+        click(dialog, QStringLiteral("Показать коды восстановления"));
+        check(codes->toPlainText() == QStringLiteral("TEST-CODE-ONE\nTEST-CODE-TWO"), "saved codes missing");
+        click(dialog, QStringLiteral("Копировать коды восстановления"));
+        check(QApplication::clipboard()->text() == codes->toPlainText(), "codes copy failed");
+        click(dialog, QStringLiteral("Закрыть"));
+    });
+    group = sites->topLevelItem(0);
+    check(group->isExpanded(), "new site's group must be expanded");
+    const auto groupRect = sites->visualItemRect(group);
+    const auto point = QPoint(groupRect.left() - sites->indentation() / 2, groupRect.center().y());
+    const auto toggle = [&] {
+        QMouseEvent clickEvent(QEvent::MouseButtonPress, QPointF(point),
+            QPointF(sites->viewport()->mapToGlobal(point)), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(sites->viewport(), &clickEvent);
+        QApplication::processEvents();
+    };
+    toggle();
+    check(!group->isExpanded() && countCards(window) == 0, "group row click did not collapse");
+    auto *siteCard = window.findChild<QPushButton *>(QStringLiteral("siteCard"));
+    check(siteCard && siteCard->isVisible()
+          && siteCard->accessibleName() == QStringLiteral("Открыть сайт Telegram"), "group site card missing");
+    const auto groupPreview = qEnvironmentVariable("LOCALVAULT_GROUP_PREVIEW");
+    if (!groupPreview.isEmpty())
+        check(window.grab().save(groupPreview), "could not save group card preview");
+    siteCard->click();
+    QApplication::processEvents();
+    group = sites->topLevelItem(0);
+    check(group->isExpanded() && sites->currentItem() == group->child(0)
+          && countCards(window) == 1, "site card did not navigate to account cards");
+    const auto nextRect = sites->visualItemRect(group);
+    const auto nextPoint = QPoint(nextRect.left() - sites->indentation() / 2, nextRect.center().y());
+    QMouseEvent groupClick(QEvent::MouseButtonPress, QPointF(nextPoint),
+        QPointF(sites->viewport()->mapToGlobal(nextPoint)), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(sites->viewport(), &groupClick);
+    QApplication::processEvents();
+    toggle();
+    check(group->isExpanded(), "group row click did not expand");
+    sites->setCurrentItem(group->child(0));
+    QApplication::processEvents();
+    check(countCards(window) == 1, "nested site did not open its accounts");
+    auto *search = field(window, QStringLiteral("Поиск по названию"));
+    search->setText(QStringLiteral("Tele"));
+    group = sites->topLevelItem(0);
+    check(group && group->childCount() == 1 && group->isExpanded(), "site search didn't expand matching group");
+    search->clear();
+    group = sites->topLevelItem(0);
+    sites->setCurrentItem(group);
+    interact(window, QStringLiteral("Изменить группу"), [&](QDialog &dialog) {
+        check(formField(dialog, QStringLiteral("Название группы"))->text() == QStringLiteral("СОЦСЕТИ"),
+              "context menu edits wrong group");
+        textButton(dialog, QStringLiteral("Отмена"))->click();
+    });
+    sites->setCurrentItem(nullptr);
+    addSite(window, QStringLiteral("Standalone"), QStringLiteral("https://standalone.example"));
+    check(sites->topLevelItemCount() == 2 && !sites->currentItem()->parent(),
+          "empty-area context menu did not create an ungrouped site");
+    const auto assertNoDialogOnClick = [&](QWidget *target, const QPoint &point) {
+        bool unexpected = false;
+        QTimer watchdog;
+        watchdog.setSingleShot(true);
+        QObject::connect(&watchdog, &QTimer::timeout, &window, [&] {
+            if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+                unexpected = true;
+                dialog->reject();
+            }
+        });
+        watchdog.start(0);
+        QMouseEvent event(QEvent::MouseButtonPress, QPointF(point),
+            QPointF(target->mapToGlobal(point)), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(target, &event);
+        watchdog.stop();
+        check(!unexpected && !QApplication::activeModalWidget(), "left click opened a creation dialog");
+    };
+    const auto blank = QPoint(70, sites->viewport()->height() - 5);
+    assertNoDialogOnClick(sites->viewport(), blank);
+    auto *sidebar = window.findChild<QWidget *>(QStringLiteral("sidebar"));
+    assertNoDialogOnClick(sidebar, QPoint(3, sidebar->height() - 3));
+    QTimer::singleShot(0, &window, [&] {
+        if (auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget())) {
+            const auto preview = qEnvironmentVariable("LOCALVAULT_MENU_PREVIEW");
+            if (!preview.isEmpty())
+                menu->grab().save(preview);
+            menu->close();
+        }
+    });
+    sites->customContextMenuRequested(blank);
+    assertNoDialogOnClick(sites->viewport(), blank);
+    click(window, QStringLiteral("Заблокировать"));
+}
+
+void checkIconPicker()
+{
+    const auto names = availableSiteIcons();
+    check(names.size() >= 2000 && names.contains(QStringLiteral("telegram"))
+          && names.contains(QStringLiteral("discord")), "full Bootstrap catalogue missing");
+    IconPicker picker(nullptr);
+    picker.show();
+    QApplication::processEvents();
+    bool chosen = false;
+    QTimer::singleShot(0, &picker, [&] {
+        auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        if (!menu)
+            return;
+        auto *search = menu->findChild<QLineEdit *>();
+        auto *view = menu->findChild<QListView *>();
+        if (!search || !view) { menu->close(); return; }
+        search->setText(QStringLiteral("telegram"));
+        if (view->model()->rowCount() == 1) {
+            const auto index = view->model()->index(0, 0);
+            chosen = index.data().toString() == QStringLiteral("telegram")
+                && !qvariant_cast<QIcon>(index.data(Qt::DecorationRole)).isNull();
+            view->clicked(index);
+        } else {
+            menu->close();
+        }
+    });
+    picker.click();
+    check(chosen && picker.selectedName() == QStringLiteral("telegram"), "icon search or selection failed");
+}
 }
 
 int main(int argc, char *argv[])
@@ -352,6 +568,8 @@ int main(int argc, char *argv[])
             checkUi(directory.filePath(QStringLiteral("widgets.lvault")));
             checkSavedPath(directory.filePath(QStringLiteral("default.lvault")),
                            directory.filePath(QStringLiteral("external.lvault")));
+            checkNewFeatures(directory.filePath(QStringLiteral("groups.lvault")));
+            checkIconPicker();
         }
         std::cout << "Widget checks passed.\n";
     } catch (const Failure &failure) {

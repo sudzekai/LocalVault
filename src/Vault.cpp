@@ -19,7 +19,8 @@
 #include <utility>
 
 namespace {
-constexpr quint32 vaultFormat = 3;
+constexpr quint32 vaultFormat = 4;
+constexpr quint32 previousFormat = 3;
 constexpr int keySize = 32;
 constexpr int saltSize = crypto_pwhash_SALTBYTES;
 constexpr int nonceSize = 12;
@@ -32,6 +33,13 @@ constexpr qsizetype maxFile = maxPayload + headerSize + tagSize + checksumSize;
 constexpr int maxEntries = 10000;
 constexpr int maxField = 2048;
 constexpr qint64 noDate = std::numeric_limits<qint64>::min();
+constexpr quint32 recoveryCodesExtension = 0x52454331;
+
+bool validIconName(const QString &name)
+{
+    static const QRegularExpression pattern(QStringLiteral("\\A[a-z0-9]+(?:-[a-z0-9]+)*\\z"));
+    return name.isEmpty() || (name.size() <= 100 && pattern.match(name).hasMatch());
+}
 
 [[noreturn]] void fail(VaultError code, const QString &message)
 {
@@ -69,7 +77,7 @@ QByteArray headerParameters(const VaultHeader &header)
 {
     QByteArray bytes("LVLT", 4);
     QDataStream stream(&bytes, QIODevice::Append);
-    stream << vaultFormat << header.operations << header.memoryKiB;
+    stream << header.version << header.operations << header.memoryKiB;
     bytes.append(header.salt);
     return bytes;
 }
@@ -85,6 +93,7 @@ bool validSite(const Site &site)
 {
     const QUrl url(site.url, QUrl::StrictMode);
     return !site.id.isNull() && !site.name.trimmed().isEmpty()
+        && validIconName(site.iconName)
         && site.name.size() <= maxField && site.url.size() <= maxField
         && url.isValid() && !url.host().isEmpty() && url.userInfo().isEmpty()
         && (url.scheme() == QStringLiteral("http") || url.scheme() == QStringLiteral("https"));
@@ -110,7 +119,10 @@ QString siteUrlKey(const QString &url)
 bool validEntry(const Entry &entry)
 {
     return !entry.id.isNull() && !entry.siteId.isNull() && !entry.login.trimmed().isEmpty()
-        && !entry.password.isEmpty() && entry.login.size() <= maxField && entry.password.size() <= maxField
+        && (entry.alternativeSignIn ? !entry.signInMethod.trimmed().isEmpty() : !entry.password.isEmpty())
+        && entry.login.size() <= maxField && entry.password.size() <= maxField && entry.signInMethod.size() <= maxField
+        && (entry.alternativeSignIn || entry.signInMethod.isEmpty())
+        && entry.recoveryCodes.size() <= Entry::maxRecoveryCodesLength
         && entry.userName.size() <= maxField && entry.phone.size() <= maxField
         && (!entry.createdAt.isValid() || (entry.createdAt.date().year() >= 1
                                         && entry.createdAt.date().year() <= 9999));
@@ -131,11 +143,11 @@ void writeField(QDataStream &stream, const QString &field)
         stream << character.unicode();
 }
 
-void readField(QDataStream &stream, QString &field)
+void readField(QDataStream &stream, QString &field, int limit = maxField)
 {
     quint16 size = 0;
     stream >> size;
-    if (size > maxField || stream.device()->bytesAvailable() < size * 2)
+    if (size > limit || stream.device()->bytesAvailable() < size * 2)
         damaged();
     field.resize(size);
     for (auto &character : field) {
@@ -147,33 +159,55 @@ void readField(QDataStream &stream, QString &field)
 
 void serialize(const VaultData &data, QByteArray &payload)
 {
-    if (data.sites.size() > maxEntries || data.entries.size() > maxEntries)
+    if (data.groups.size() > maxEntries || data.sites.size() > maxEntries || data.entries.size() > maxEntries)
         fail(VaultError::Limit, QStringLiteral("Достигнут предел количества сайтов или аккаунтов."));
-    qint64 size = 12;
+    qint64 size = 16;
+    for (const auto &group : data.groups)
+        size += 20 + 2 * (group.name.size() + group.iconName.size());
     for (const auto &site : data.sites)
-        size += 20 + 2 * (site.name.size() + site.url.size());
+        size += 38 + 2 * (site.name.size() + site.url.size() + site.iconName.size());
     for (const auto &entry : data.entries) {
-        size += 50 + 2 * (entry.login.size() + entry.password.size()
-                        + entry.userName.size() + entry.phone.size());
+        size += 53 + 2 * (entry.login.size() + entry.password.size()
+                        + entry.userName.size() + entry.phone.size() + entry.signInMethod.size());
         for (const auto &email : entry.emails)
             size += 4 + 2 * (email.address.size() + email.description.size());
+    }
+    const auto codeCount = std::count_if(data.entries.begin(), data.entries.end(), [](const Entry &entry) {
+        return !entry.recoveryCodes.isEmpty();
+    });
+    if (codeCount > 0) {
+        size += 8;
+        for (const auto &entry : data.entries) {
+            if (!entry.recoveryCodes.isEmpty())
+                size += 18 + 2 * entry.recoveryCodes.size();
+        }
     }
     if (size > maxPayload)
         fail(VaultError::Limit, QStringLiteral("Достигнут предельный размер хранилища."));
     payload.reserve(size);
     QDataStream stream(&payload, QIODevice::WriteOnly);
     stream.setVersion(QDataStream::Qt_6_0);
-    stream << quint32(data.idleMinutes) << quint32(data.sites.size()) << quint32(data.entries.size());
+    stream << quint32(data.idleMinutes) << quint32(data.groups.size())
+           << quint32(data.sites.size()) << quint32(data.entries.size());
+    for (const auto &group : data.groups) {
+        stream << group.id;
+        writeField(stream, group.name);
+        writeField(stream, group.iconName);
+    }
     for (const auto &site : data.sites) {
         stream << site.id;
         writeField(stream, site.name);
         writeField(stream, site.url);
+        stream << site.groupId;
+        writeField(stream, site.iconName);
     }
     for (const auto &entry : data.entries) {
         stream << entry.id << entry.siteId;
         stream << (entry.createdAt.isValid() ? entry.createdAt.toMSecsSinceEpoch() : noDate);
         writeField(stream, entry.login);
         writeField(stream, entry.password);
+        stream << quint8(entry.alternativeSignIn ? 1 : 0);
+        writeField(stream, entry.signInMethod);
         writeField(stream, entry.userName);
         writeField(stream, entry.phone);
         stream << quint16(entry.emails.size());
@@ -182,24 +216,54 @@ void serialize(const VaultData &data, QByteArray &payload)
             writeField(stream, email.description);
         }
     }
+    // Optional tail keeps files created by the first format-4 preview readable.
+    if (codeCount > 0) {
+        stream << recoveryCodesExtension << quint32(codeCount);
+        for (const auto &entry : data.entries) {
+            if (!entry.recoveryCodes.isEmpty()) {
+                stream << entry.id;
+                writeField(stream, entry.recoveryCodes);
+            }
+        }
+    }
     if (stream.status() != QDataStream::Ok)
         fail(VaultError::Io, QStringLiteral("Не удалось подготовить записи к сохранению."));
 }
 
-VaultData deserialize(const QByteArray &payload)
+VaultData deserialize(const QByteArray &payload, quint32 version)
 {
     QDataStream stream(payload);
     stream.setVersion(QDataStream::Qt_6_0);
     quint32 idle = 0;
+    quint32 groupCount = 0;
     quint32 siteCount = 0;
     quint32 count = 0;
-    stream >> idle >> siteCount >> count;
-    if (idle < 1 || idle > 120 || siteCount > maxEntries || count > maxEntries)
+    stream >> idle;
+    if (version == vaultFormat)
+        stream >> groupCount;
+    stream >> siteCount >> count;
+    if (idle < 1 || idle > 120 || groupCount > maxEntries || siteCount > maxEntries || count > maxEntries)
         damaged();
     VaultData data;
     data.idleMinutes = int(idle);
     data.sites.reserve(siteCount);
     data.entries.reserve(count);
+    data.groups.reserve(groupCount);
+    QSet<QUuid> groupIds;
+    QSet<QString> groupNames;
+    while (groupCount--) {
+        Group group;
+        stream >> group.id;
+        readField(stream, group.name);
+        readField(stream, group.iconName);
+        const auto key = siteNameKey(group.name);
+        if (stream.status() != QDataStream::Ok || group.id.isNull() || key.isEmpty() || !validIconName(group.iconName)
+            || groupIds.contains(group.id) || groupNames.contains(key))
+            damaged();
+        groupIds.insert(group.id);
+        groupNames.insert(key);
+        data.groups.push_back(std::move(group));
+    }
     QSet<QUuid> siteIds;
     QSet<QString> names;
     QSet<QString> urls;
@@ -208,10 +272,15 @@ VaultData deserialize(const QByteArray &payload)
         stream >> site.id;
         readField(stream, site.name);
         readField(stream, site.url);
+        if (version == vaultFormat) {
+            stream >> site.groupId;
+            readField(stream, site.iconName);
+        }
         const auto name = siteNameKey(site.name);
         const auto url = siteUrlKey(site.url);
         if (stream.status() != QDataStream::Ok || !validSite(site) || siteIds.contains(site.id)
-            || names.contains(name) || urls.contains(url))
+            || names.contains(name) || urls.contains(url)
+            || (!site.groupId.isNull() && !groupIds.contains(site.groupId)))
             damaged();
         siteIds.insert(site.id);
         names.insert(name);
@@ -229,6 +298,14 @@ VaultData deserialize(const QByteArray &payload)
             damaged();
         readField(stream, entry.login);
         readField(stream, entry.password);
+        if (version == vaultFormat) {
+            quint8 alternative = 0;
+            stream >> alternative;
+            if (alternative > 1)
+                damaged();
+            entry.alternativeSignIn = alternative == 1;
+            readField(stream, entry.signInMethod);
+        }
         readField(stream, entry.userName);
         readField(stream, entry.phone);
         stream >> emailCount;
@@ -246,6 +323,24 @@ VaultData deserialize(const QByteArray &payload)
             damaged();
         ids.insert(entry.id);
         data.entries.push_back(std::move(entry));
+    }
+    if (version == vaultFormat && !stream.atEnd()) {
+        quint32 extension = 0;
+        quint32 codeCount = 0;
+        stream >> extension >> codeCount;
+        if (extension != recoveryCodesExtension || codeCount > data.entries.size())
+            damaged();
+        QSet<QUuid> seen;
+        while (codeCount--) {
+            QUuid id;
+            stream >> id;
+            const auto entry = std::find_if(data.entries.begin(), data.entries.end(),
+                                            [&](const Entry &item) { return item.id == id; });
+            if (entry == data.entries.end() || seen.contains(id))
+                damaged();
+            seen.insert(id);
+            readField(stream, entry->recoveryCodes, Entry::maxRecoveryCodesLength);
+        }
     }
     if (!stream.atEnd() || stream.status() != QDataStream::Ok)
         damaged();
@@ -304,12 +399,29 @@ void SecureKey::Deleter::operator()(unsigned char *data) const
     sodium_free(data);
 }
 
-Site &Site::operator=(Site &&other) noexcept
+Group &Group::operator=(Group &&other) noexcept
 {
     if (this != &other) {
         id = other.id;
         name.swap(other.name);
+        iconName.swap(other.iconName);
+    }
+    return *this;
+}
+
+Group::~Group()
+{
+    wipe(name);
+}
+
+Site &Site::operator=(Site &&other) noexcept
+{
+    if (this != &other) {
+        id = other.id;
+        groupId = other.groupId;
+        name.swap(other.name);
         url.swap(other.url);
+        iconName.swap(other.iconName);
     }
     return *this;
 }
@@ -340,6 +452,9 @@ Entry &Entry::operator=(Entry &&other) noexcept
         siteId = other.siteId;
         login.swap(other.login);
         password.swap(other.password);
+        std::swap(alternativeSignIn, other.alternativeSignIn);
+        signInMethod.swap(other.signInMethod);
+        recoveryCodes.swap(other.recoveryCodes);
         userName.swap(other.userName);
         phone.swap(other.phone);
         createdAt.swap(other.createdAt);
@@ -352,6 +467,8 @@ Entry::~Entry()
 {
     wipe(login);
     wipe(password);
+    wipe(signInMethod);
+    wipe(recoveryCodes);
     wipe(userName);
     wipe(phone);
 }
@@ -397,6 +514,8 @@ Session CryptoManager::derive(VaultHeader header, const QString &password)
 
 QByteArray CryptoManager::encrypt(const Session &session, const VaultData &data)
 {
+    if (session.header.version != vaultFormat)
+        fail(VaultError::Version, QStringLiteral("Перед сохранением требуется обновление хранилища."));
     const QByteArray diversifier = randomBytes(keySize);
     const QByteArray nonce = randomBytes(nonceSize);
     SecureKey writeKey;
@@ -446,7 +565,7 @@ VaultData CryptoManager::decrypt(const Session &session, const QByteArray &file)
         damaged();
     sodium_memzero(payload.value.data() + written, EVP_MAX_BLOCK_LENGTH);
     payload.value.chop(EVP_MAX_BLOCK_LENGTH);
-    return deserialize(payload.value);
+    return deserialize(payload.value, session.header.version);
 }
 
 StorageManager::StorageManager(QString path) : path(std::move(path)) {}
@@ -490,10 +609,11 @@ VaultHeader StorageManager::readHeader(const QByteArray &file)
     quint32 version = 0;
     VaultHeader header;
     stream >> version >> header.operations >> header.memoryKiB;
+    header.version = version;
     if (QCryptographicHash::hash(QByteArrayView(file).chopped(checksumSize), QCryptographicHash::Sha256)
             != file.last(checksumSize))
         damaged();
-    if (version != vaultFormat)
+    if (version != vaultFormat && version != previousFormat)
         fail(VaultError::Version, QStringLiteral("Эта версия LocalVault не поддерживает формат выбранного хранилища."));
     if (header.operations < 2 || header.operations > 6
         || header.memoryKiB < 32 * 1024 || header.memoryKiB > 256 * 1024)
@@ -545,8 +665,17 @@ void PasswordManager::open(const QString &password)
     const QByteArray file = storage.read();
     auto candidate = AuthManager::unlock(file, password);
     auto decoded = CryptoManager::decrypt(candidate, file);
-    records = std::move(decoded);
     revision = QCryptographicHash::hash(file, QCryptographicHash::Sha256);
+    try {
+        if (candidate.header.version == previousFormat) {
+            candidate = AuthManager::create(password);
+            commitFile(CryptoManager::encrypt(candidate, decoded));
+        }
+    } catch (...) {
+        revision.clear();
+        throw;
+    }
+    records = std::move(decoded);
     access = std::move(fileAccess);
     session.emplace(std::move(candidate));
 }
@@ -592,7 +721,12 @@ void PasswordManager::importFrom(const QString &path, const QString &password)
     const QByteArray file = StorageManager(path).read();
     auto candidate = AuthManager::unlock(file, password);
     auto decoded = CryptoManager::decrypt(candidate, file);
-    commitFile(file);
+    if (candidate.header.version == previousFormat) {
+        candidate = AuthManager::create(password);
+        commitFile(CryptoManager::encrypt(candidate, decoded));
+    } else {
+        commitFile(file);
+    }
     records = std::move(decoded);
     if (fileAccess)
         access = std::move(fileAccess);
@@ -688,11 +822,55 @@ void putRecord(std::vector<Record> &items, Record record, Save save)
 }
 }
 
+void PasswordManager::putGroup(Group group)
+{
+    activeSession();
+    const auto key = siteNameKey(group.name);
+    if (group.id.isNull() || key.isEmpty() || group.name.size() > maxField || !validIconName(group.iconName))
+        fail(VaultError::Invalid, QStringLiteral("Укажите название группы."));
+    if (std::any_of(records.groups.begin(), records.groups.end(), [&](const Group &item) {
+            return item.id != group.id && siteNameKey(item.name) == key;
+        }))
+        fail(VaultError::Invalid, QStringLiteral("Группа с таким названием уже есть."));
+    putRecord(records.groups, std::move(group), [this] { save(); });
+}
+
+void PasswordManager::removeGroup(const QUuid &id)
+{
+    activeSession();
+    auto &groups = records.groups;
+    const auto group = std::find_if(groups.begin(), groups.end(), [&](const Group &item) { return item.id == id; });
+    if (group == groups.end())
+        return;
+    std::vector<Site *> affected;
+    affected.reserve(records.sites.size());
+    for (auto &site : records.sites) {
+        if (site.groupId == id)
+            affected.push_back(&site);
+    }
+    const auto index = group - groups.begin();
+    Group previous(std::move(*group));
+    groups.erase(group);
+    for (auto *site : affected)
+        site->groupId = QUuid{};
+    try {
+        save();
+    } catch (...) {
+        groups.insert(groups.begin() + index, std::move(previous));
+        for (auto *site : affected)
+            site->groupId = id;
+        throw;
+    }
+}
+
 void PasswordManager::putSite(Site site)
 {
     activeSession();
     if (!validSite(site))
         fail(VaultError::Invalid, QStringLiteral("Укажите название и адрес сайта с https:// или http://."));
+    if (!site.groupId.isNull() && std::none_of(records.groups.begin(), records.groups.end(),
+        [&](const Group &group) { return group.id == site.groupId; }))
+        fail(VaultError::Invalid, QStringLiteral("Выбранная группа не существует."));
     const auto name = siteNameKey(site.name);
     const auto url = siteUrlKey(site.url);
     const bool duplicate = std::any_of(records.sites.begin(), records.sites.end(), [&](const Site &item) {
@@ -738,8 +916,10 @@ void PasswordManager::removeSite(const QUuid &id)
 void PasswordManager::put(Entry entry)
 {
     activeSession();
+    if (entry.recoveryCodes.size() > Entry::maxRecoveryCodesLength)
+        fail(VaultError::Invalid, QStringLiteral("Поле кодов восстановления содержит слишком много символов."));
     if (!validEntry(entry))
-        fail(VaultError::Invalid, QStringLiteral("Укажите логин и пароль."));
+        fail(VaultError::Invalid, QStringLiteral("Укажите логин и пароль или включите альтернативный вход и опишите способ."));
     if (!validEmails(entry.emails))
         fail(VaultError::Invalid, QStringLiteral("Проверьте адреса электронной почты в формате имя@домен."));
     if (std::none_of(records.sites.begin(), records.sites.end(), [&](const Site &site) {

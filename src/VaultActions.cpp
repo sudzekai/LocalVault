@@ -1,10 +1,13 @@
 #include "MainWindow.h"
 #include "Dialogs.h"
+#include "IconPicker.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTimeEdit>
 #include <QDir>
 #include <QFileInfo>
+#include <QKeyEvent>
 #include <QLocale>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -12,11 +15,28 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSpinBox>
+#include <QTextDocument>
 
 namespace {
+class RecoveryCodesEditor : public QPlainTextEdit {
+public:
+    using QPlainTextEdit::QPlainTextEdit;
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (event->matches(QKeySequence::Copy) || event->matches(QKeySequence::Cut)) {
+            event->accept();
+            return;
+        }
+        QPlainTextEdit::keyPressEvent(event);
+    }
+};
+
 void clearFields(std::initializer_list<QLineEdit *> fields)
 {
     for (auto *field : fields)
@@ -145,6 +165,74 @@ private:
 };
 }
 
+void MainWindow::groupDialog(bool edit)
+{
+    const auto id = edit ? selectedGroup : QUuid::createUuid();
+    if (id.isNull())
+        return;
+    QDialog dialog(this);
+    dialog.setWindowTitle(edit ? QStringLiteral("Изменить группу") : QStringLiteral("Новая группа"));
+    dialog.setMinimumWidth(400);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(20, 20, 20, 16);
+    auto *form = stackedForm(layout);
+    auto *name = new QLineEdit(&dialog);
+    name->setMaxLength(2048);
+    name->setPlaceholderText(QStringLiteral("Например, СОЦСЕТИ"));
+    form->addRow(QStringLiteral("Название группы"), name);
+    QString previousIcon;
+    if (edit) {
+        for (const auto &group : manager.data().groups) {
+            if (group.id == id)
+                previousIcon = group.iconName;
+            if (group.id == id)
+                name->setText(group.name);
+        }
+    }
+    auto *icon = new IconPicker(&dialog, previousIcon);
+    form->addRow(QStringLiteral("Иконка"), icon);
+    const auto cleanup = qScopeGuard([&] { clearText(name); });
+    auto *error = label({}, &dialog, "error");
+    layout->addWidget(error);
+    auto *controls = dialogButtons(dialog, layout, QStringLiteral("Сохранить"), true);
+    connect(controls, &QDialogButtonBox::accepted, &dialog, [&] {
+        if (!manager.unlocked())
+            return;
+        Group group;
+        group.id = id;
+        group.name = name->text().simplified();
+        group.iconName = icon->selectedName();
+        try {
+            manager.putGroup(std::move(group));
+            dialog.accept();
+        } catch (const Failure &failure) {
+            error->setText(failure.message);
+        }
+    });
+    if (dialog.exec() == QDialog::Accepted) {
+        selectedGroup = id;
+        selectedSite = QUuid{};
+        expandedGroups.insert(id);
+        const QSignalBlocker block(search);
+        clearText(search);
+        refresh();
+    }
+}
+
+void MainWindow::removeGroup()
+{
+    const auto id = selectedGroup;
+    if (id.isNull() || !confirmRemoval(this, QStringLiteral("Удалить группу? Её сайты и аккаунты останутся в общем списке."))
+        || !manager.unlocked())
+        return;
+    try {
+        manager.removeGroup(id);
+        refresh();
+    } catch (const Failure &failure) {
+        showError(failure);
+    }
+}
+
 void MainWindow::siteDialog(const Site *site)
 {
     const auto id = site ? site->id : QUuid::createUuid();
@@ -163,6 +251,16 @@ void MainWindow::siteDialog(const Site *site)
     url->setPlaceholderText(QStringLiteral("https://example.com"));
     form->addRow(QStringLiteral("Название"), name);
     form->addRow(QStringLiteral("Адрес"), url);
+    auto *group = new QComboBox(&dialog);
+    group->setAccessibleName(QStringLiteral("Группа сайта"));
+    group->addItem(QStringLiteral("Без группы"), QUuid{});
+    for (const auto &item : manager.data().groups)
+        group->addItem(item.name, item.id);
+    const auto previousGroup = site ? site->groupId : selectedGroup;
+    group->setCurrentIndex(qMax(0, group->findData(previousGroup)));
+    form->addRow(QStringLiteral("Группа"), group);
+    auto *icon = new IconPicker(&dialog, site ? site->iconName : QString{});
+    form->addRow(QStringLiteral("Иконка"), icon);
     const auto cleanup = qScopeGuard([&] { clearFields({name, url}); });
     auto *error = label({}, &dialog, "error");
     layout->addWidget(error);
@@ -174,6 +272,8 @@ void MainWindow::siteDialog(const Site *site)
         edited.id = id;
         edited.name = name->text().simplified();
         edited.url = url->text().trimmed();
+        edited.groupId = group->currentData().toUuid();
+        edited.iconName = icon->selectedName();
         try {
             manager.putSite(std::move(edited));
             dialog.accept();
@@ -225,6 +325,7 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
     auto *body = new QWidget(scroll);
     scroll->setWidget(body);
     auto *layout = new QVBoxLayout(body);
+    layout->setSizeConstraint(QLayout::SetMinimumSize);
     layout->setContentsMargins(0, 0, 0, 4);
     layout->setSpacing(12);
     auto *form = stackedForm(layout);
@@ -258,6 +359,24 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
         password->setText(entry->password);
     }
     addStrength(layout, password);
+    auto *signInForm = stackedForm(layout);
+    auto *alternative = new QCheckBox(QStringLiteral("Альтернативный способ входа"), body);
+    alternative->setChecked(entry && entry->alternativeSignIn);
+    alternative->setEnabled(!readOnly);
+    signInForm->addRow(alternative);
+    auto *method = new QLineEdit(entry ? entry->signInMethod : QString{}, body);
+    method->setMaxLength(2048);
+    method->setPlaceholderText(QStringLiteral("Например, OAuth через Google или аутентификатор"));
+    method->setReadOnly(readOnly);
+    method->setEnabled(alternative->isChecked());
+    signInForm->addRow(QStringLiteral("Способ входа"), method);
+    connect(alternative, &QCheckBox::toggled, method, &QLineEdit::setEnabled);
+    connect(alternative, &QCheckBox::toggled, password, [password](bool enabled) {
+        password->setPlaceholderText(enabled ? QStringLiteral("Пароль (необязательно)") : QStringLiteral("Введите пароль"));
+    });
+    if (!readOnly && alternative->isChecked())
+        password->setPlaceholderText(QStringLiteral("Пароль (необязательно)"));
+    const auto clearMethod = qScopeGuard([&] { clearText(method); });
     if (!readOnly) {
         iconButton(passwordRow, body, QStringLiteral("Сгенерировать пароль"), "shuffle", [&] {
             GeneratorDialog generator(&dialog, QStringLiteral("Использовать пароль"));
@@ -310,6 +429,53 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
     }
     if (readOnly && entry->emails.empty())
         layout->addWidget(label(QStringLiteral("Адреса не указаны."), body));
+
+    auto *codesHeader = new QHBoxLayout;
+    auto *codesTitle = label(QStringLiteral("Запасные коды восстановления"), body, "cardTitle");
+    codesTitle->setWordWrap(false);
+    codesHeader->addWidget(codesTitle);
+    codesHeader->addStretch();
+    layout->addLayout(codesHeader);
+    auto *codes = new RecoveryCodesEditor(body);
+    codes->setAccessibleName(QStringLiteral("Коды восстановления"));
+    codes->setPlaceholderText(QStringLiteral("Вставьте коды, каждый с новой строки"));
+    codes->setUndoRedoEnabled(false);
+    codes->setContextMenuPolicy(Qt::NoContextMenu);
+    codes->setInputMethodHints(Qt::ImhHiddenText | Qt::ImhSensitiveData | Qt::ImhNoPredictiveText);
+    codes->setReadOnly(readOnly);
+    codes->setFixedHeight(110);
+    if (entry)
+        codes->setPlainText(entry->recoveryCodes);
+    codes->hide();
+    layout->addWidget(codes);
+    auto *masked = label(codes->document()->isEmpty() ? QStringLiteral("Коды не указаны")
+                                                     : QStringLiteral("••••••••"), body);
+    layout->addWidget(masked);
+    auto *revealCodes = iconButton(codesHeader, body, QStringLiteral("Показать коды восстановления"), "eye", [] {});
+    revealCodes->setCheckable(true);
+    connect(revealCodes, &QPushButton::toggled, codes, [=](bool shown) {
+        codes->setVisible(shown);
+        masked->setVisible(!shown);
+        masked->setText(codes->document()->isEmpty() ? QStringLiteral("Коды не указаны") : QStringLiteral("••••••••"));
+        setAction(revealCodes, shown ? QStringLiteral("Скрыть коды восстановления")
+                                    : QStringLiteral("Показать коды восстановления"), shown ? "eye-slash" : "eye");
+        if (shown)
+            codes->setFocus();
+    });
+    auto *copyCodes = iconButton(codesHeader, body, QStringLiteral("Копировать коды восстановления"), "copy", [&] {
+        QString value = codes->toPlainText();
+        copy(value);
+        wipe(value);
+    });
+    copyCodes->setEnabled(!codes->document()->isEmpty());
+    connect(codes, &QPlainTextEdit::textChanged, copyCodes, [=] {
+        copyCodes->setEnabled(!codes->document()->isEmpty());
+    });
+    const auto clearCodes = qScopeGuard([&] {
+        QString value = codes->toPlainText();
+        codes->clear();
+        wipe(value);
+    });
     layout->addStretch();
     if (readOnly) {
         auto *actions = new QHBoxLayout;
@@ -341,9 +507,13 @@ void MainWindow::entryDialog(const Entry *entry, bool readOnly)
         edited.siteId = siteId;
         edited.login = login->text();
         edited.password = password->text();
+        edited.alternativeSignIn = alternative->isChecked();
+        if (edited.alternativeSignIn)
+            edited.signInMethod = method->text().trimmed();
         edited.userName = userName->text().trimmed();
         edited.phone = phone->text().trimmed();
         edited.emails = emails.collect();
+        edited.recoveryCodes = codes->toPlainText();
         if (!withDate->isChecked())
             edited.createdAt = {};
         else if (dateEdited)

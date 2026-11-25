@@ -1,4 +1,5 @@
 #include "Vault.h"
+#include "LegacyFixture.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -79,7 +80,7 @@ void checkVault()
     manager.create(oldPassword);
     check(manager.unlocked(), "create did not unlock");
     const auto firstFile = storage.read();
-    check(qFromBigEndian<quint32>(firstFile.constData() + 4) == 3, "unexpected file format");
+    check(qFromBigEndian<quint32>(firstFile.constData() + 4) == 4, "unexpected file format");
     expectError(VaultError::Io, [&] { manager.create(newPassword); });
     expectError(VaultError::Invalid, [&] { manager.put(account(QUuid::createUuid(), QStringLiteral("orphan"))); });
 
@@ -248,6 +249,119 @@ void checkExternalPath()
     other.open(password);
     check(other.data().sites.size() == 2 && !QFile::exists(defaultPath), "changes were not saved directly");
 }
+
+void checkGroupsAndAlternativeSignIn()
+{
+    QTemporaryDir dir;
+    const auto path = dir.filePath(QStringLiteral("groups.lvault"));
+    const auto password = QStringLiteral("test master for groups");
+    PasswordManager manager(path);
+    manager.create(password);
+    Group group;
+    group.name = QStringLiteral("СОЦСЕТИ");
+    group.iconName = QStringLiteral("people");
+    const auto groupId = group.id;
+    manager.putGroup(std::move(group));
+    Group duplicate;
+    duplicate.name = QStringLiteral(" соцсети ");
+    expectError(VaultError::Invalid, [&] { manager.putGroup(std::move(duplicate)); });
+    auto telegram = site(QStringLiteral("Telegram"), QStringLiteral("https://telegram.org"));
+    const auto siteId = telegram.id;
+    telegram.groupId = groupId;
+    telegram.iconName = QStringLiteral("telegram");
+    manager.putSite(std::move(telegram));
+    auto oauth = account(siteId, QStringLiteral("oauth-test"));
+    oauth.password.clear();
+    expectError(VaultError::Invalid, [&] {
+        auto missing = account(siteId, QStringLiteral("missing"));
+        missing.password.clear();
+        manager.put(std::move(missing));
+    });
+    oauth.alternativeSignIn = true;
+    expectError(VaultError::Invalid, [&] {
+        auto missing = account(siteId, QStringLiteral("missing-description"));
+        missing.password.clear();
+        missing.alternativeSignIn = true;
+        manager.put(std::move(missing));
+    });
+    oauth.signInMethod = QStringLiteral("OAuth через Google");
+    oauth.recoveryCodes = QStringLiteral("SYNTHETIC-RECOVERY-001\nSYNTHETIC-RECOVERY-002");
+    manager.put(std::move(oauth));
+    const auto encrypted = StorageManager(path).read();
+    check(!encrypted.contains("SYNTHETIC-RECOVERY"), "recovery codes visible on disk");
+    manager.lock();
+    manager.open(password);
+    check(manager.data().groups.size() == 1 && manager.data().groups[0].iconName == QStringLiteral("people")
+          && manager.data().sites[0].groupId == groupId
+          && manager.data().sites[0].iconName == QStringLiteral("telegram"), "group and icon round trip failed");
+    const auto &saved = manager.data().entries[0];
+    check(saved.password.isEmpty() && saved.alternativeSignIn
+          && saved.signInMethod == QStringLiteral("OAuth через Google"), "alternative sign in round trip failed");
+    check(saved.recoveryCodes == QStringLiteral("SYNTHETIC-RECOVERY-001\nSYNTHETIC-RECOVERY-002"),
+          "recovery codes round trip failed");
+    const auto backup = dir.filePath(QStringLiteral("recovery-backup.lvault"));
+    manager.exportTo(backup);
+    PasswordManager restored(dir.filePath(QStringLiteral("restored.lvault")));
+    restored.importFrom(backup, password);
+    const auto nextPassword = QStringLiteral("recovery codes new master");
+    restored.changePassword(password, nextPassword);
+    restored.lock();
+    restored.open(nextPassword);
+    check(restored.data().entries[0].recoveryCodes == saved.recoveryCodes,
+          "import or password rotation lost recovery codes");
+    manager.removeGroup(groupId);
+    check(manager.data().groups.empty() && manager.data().sites.size() == 1
+          && manager.data().sites[0].groupId.isNull() && manager.data().entries.size() == 1,
+          "group removal deleted associated data");
+}
+
+void checkPreviousVersionMigration()
+{
+    QTemporaryDir dir;
+    const auto path = dir.filePath(QStringLiteral("legacy.lvault"));
+    const auto original = QByteArray::fromBase64(legacyVaultBase64);
+    const auto password = QStringLiteral("synthetic migration master");
+    StorageManager storage(path);
+    storage.write(original);
+    PasswordManager manager(path);
+    expectError(VaultError::WrongPassword, [&] { manager.open(QStringLiteral("incorrect")); });
+    check(storage.read() == original && !manager.unlocked(), "wrong password modified the legacy file");
+
+    auto damaged = original;
+    damaged[110] = char(damaged[110] ^ 1);
+    damaged.chop(32);
+    damaged += QCryptographicHash::hash(damaged, QCryptographicHash::Sha256);
+    storage.write(damaged);
+    expectError(VaultError::Damaged, [&] { manager.open(password); });
+    check(storage.read() == damaged && !manager.unlocked(), "corrupted legacy file was rewritten");
+    storage.write(original);
+    manager.open(password);
+    const auto migrated = storage.read();
+    check(StorageManager::readHeader(migrated).version == 4 && migrated != original,
+          "legacy file was not migrated after unlock");
+    const auto &data = manager.data();
+    check(data.groups.empty() && data.sites.size() == 1 && data.entries.size() == 1 && data.idleMinutes == 17,
+          "legacy record counts or settings lost");
+    const auto &entry = data.entries[0];
+    check(entry.id == QUuid(QStringLiteral("{27be0cd2-5380-431d-a748-a5a376743a13}"))
+          && entry.siteId == data.sites[0].id && data.sites[0].groupId.isNull()
+          && entry.login == QStringLiteral("legacy synthetic login")
+          && entry.password == QStringLiteral("legacy synthetic secret")
+          && entry.userName == QStringLiteral("Test user") && entry.phone == QStringLiteral("+1 202 555 0142")
+          && entry.createdAt.toMSecsSinceEpoch() == 1700000000123
+          && entry.emails.size() == 1 && entry.emails[0].description == QStringLiteral("Fixture")
+          && !entry.alternativeSignIn && entry.signInMethod.isEmpty(), "legacy fields changed");
+    manager.lock();
+    manager.open(password);
+    check(storage.read() == migrated, "current format was migrated again");
+    manager.lock();
+    const auto backupPath = dir.filePath(QStringLiteral("import-source.lvault"));
+    StorageManager(backupPath).write(original);
+    PasswordManager imported(dir.filePath(QStringLiteral("imported.lvault")));
+    imported.importFrom(backupPath, password);
+    check(StorageManager::readHeader(StorageManager(imported.path()).read()).version == 4
+          && StorageManager(backupPath).read() == original, "legacy import failed");
+}
 }
 
 int main(int argc, char *argv[])
@@ -258,6 +372,8 @@ int main(int argc, char *argv[])
         checkVault();
         checkRollback();
         checkExternalPath();
+        checkGroupsAndAlternativeSignIn();
+        checkPreviousVersionMigration();
         checkGenerator();
         std::cout << "Vault checks passed.\n";
     } catch (const Failure &failure) {

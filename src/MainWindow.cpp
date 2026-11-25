@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "Dialogs.h"
+#include "IconPicker.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -7,9 +8,12 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QCollator>
-#include <QListWidget>
+#include <QTreeWidget>
+#include <QMouseEvent>
+#include <QPainter>
 #include <QLocale>
 #include <QMessageBox>
+#include <QMenu>
 #include <QMimeData>
 #include <QPalette>
 #include <QScopeGuard>
@@ -23,6 +27,36 @@
 
 namespace {
 constexpr char tokenFormat[] = "application/x-localvault-copy-token";
+constexpr int groupRole = Qt::UserRole + 1;
+
+class SiteTree : public QTreeWidget {
+public:
+    using QTreeWidget::QTreeWidget;
+
+protected:
+    void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override
+    {
+        painter->fillRect(rect, QColor(QStringLiteral("#181818")));
+        if (index.data(groupRole).toBool()) {
+            const auto icon = siteIcon(isExpanded(index) ? QStringLiteral("chevron-down")
+                                                        : QStringLiteral("chevron-right"));
+            const int x = rect.right() - indentation() / 2 - 5;
+            icon.paint(painter, QRect(x, rect.center().y() - 5, 10, 10));
+        }
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        auto *item = itemAt(event->position().toPoint());
+        if (event->button() == Qt::LeftButton && item && item->data(0, groupRole).toBool()) {
+            event->accept();
+            setCurrentItem(item);
+            item->setExpanded(!item->isExpanded());
+            return;
+        }
+        QTreeWidget::mousePressEvent(event);
+    }
+};
 }
 
 MainWindow::MainWindow(const QString &path)
@@ -63,22 +97,34 @@ MainWindow::MainWindow(const QString &path)
         QWidget#sidebar { background: #181818; border-right: 1px solid #2c2c2c; }
         QWidget#accountCard { background: #202020; border: 1px solid #343434; border-radius: 12px; }
         QWidget#accountCard QLabel { border: none; background: transparent; }
+        QPushButton#siteCard { background: #202020; border: 1px solid #343434; border-radius: 12px; padding: 0; }
+        QPushButton#siteCard:hover { background: #2c2c2c; border-color: #555555; }
+        QPushButton#siteCard:focus { border-color: #a3a3a3; }
+        QPushButton#siteCard QLabel { background: transparent; border: none; }
         QPushButton { background: #2c2c2c; border: 1px solid #434343; padding: 6px; border-radius: 7px; }
         QPushButton:hover, QPushButton:checked { background: #3d3d3d; }
         QPushButton:disabled { background: #202020; color: #858585; border-color: #343434; }
         QPushButton#primary { background: #414141; color: #ffffff; border-color: #646464; font-weight: 600; }
         QPushButton#primary:hover { background: #515151; }
-        QLineEdit, QSpinBox, QDateTimeEdit { background: #1b1b1b; border: 1px solid #454545; border-radius: 7px;
+        QLineEdit, QPlainTextEdit, QSpinBox, QDateTimeEdit, QComboBox { background: #1b1b1b; border: 1px solid #454545; border-radius: 7px;
             padding: 7px; selection-background-color: #505050; }
         QLineEdit:focus, QSpinBox:focus, QDateTimeEdit:focus, QPushButton:focus, QPushButton#primary:focus {
             border-color: #a3a3a3; }
-        QListWidget, QScrollArea { background: transparent; border: 0; }
-        QListWidget::item { min-height: 30px; padding: 4px 8px; border-radius: 6px; }
-        QListWidget::item:hover { background: #2c2c2c; }
-        QListWidget::item:selected { background: #343434; color: #ffffff; }
+        QTreeWidget, QScrollArea { background: transparent; border: 0; }
+        QTreeWidget { outline: 0; }
+        QTreeWidget::branch, QTreeWidget::branch:selected { background: #181818; border: 0; }
+        QTreeWidget::item { min-height: 30px; padding: 4px 8px; border-radius: 6px; }
+        QTreeWidget::item:hover { background: #2c2c2c; }
+        QTreeWidget::item:selected { background: #343434; color: #ffffff; }
         QProgressBar { background: #202020; border: 1px solid #434343; text-align: center; }
         QProgressBar::chunk { background: #555555; }
         QToolTip { background: #2c2c2c; color: #f2f2f2; border: 1px solid #555555; }
+        QMenu { background: #202020; color: #f2f2f2; border: 1px solid #454545; border-radius: 9px; padding: 5px; }
+        QMenu::item { background: transparent; padding: 8px 26px 8px 12px; border-radius: 5px; }
+        QMenu::item:selected { background: #343434; color: #ffffff; }
+        QMenu::item:disabled { color: #858585; }
+        QMenu::separator { height: 1px; background: #454545; margin: 5px 8px; }
+        QMenu::icon { padding-left: 5px; }
     )"));
 
     pages = new QStackedWidget(this);
@@ -139,16 +185,15 @@ MainWindow::MainWindow(const QString &path)
     shell->setContentsMargins(0, 0, 0, 0);
     shell->setSpacing(0);
 
-    auto *sidebar = new QWidget(vaultPage);
+    sidebar = new QWidget(vaultPage);
     sidebar->setObjectName(QStringLiteral("sidebar"));
     sidebar->setFixedWidth(246);
     auto *navigation = new QVBoxLayout(sidebar);
     navigation->setContentsMargins(16, 18, 16, 16);
     navigation->setSpacing(12);
     auto *navHeader = new QHBoxLayout;
-    navHeader->addWidget(label(QStringLiteral("Сайты"), sidebar, "brand"));
+    navHeader->addWidget(label(QStringLiteral("LocalVault"), sidebar, "brand"));
     navHeader->addStretch();
-    iconButton(navHeader, sidebar, QStringLiteral("Добавить сайт"), "plus-lg", [this] { siteDialog(); });
     navigation->addLayout(navHeader);
     search = new QLineEdit(sidebar);
     search->setPlaceholderText(QStringLiteral("Поиск по названию"));
@@ -156,8 +201,22 @@ MainWindow::MainWindow(const QString &path)
     search->setClearButtonEnabled(true);
     search->setMaxLength(2048);
     navigation->addWidget(search);
-    sites = new QListWidget(sidebar);
+    auto *tree = new SiteTree(sidebar);
+    sites = tree;
+    sites->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(sites, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &point) {
+        sidebarMenu(sites->viewport()->mapToGlobal(point), sites->itemAt(point));
+    });
+    sidebar->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(sidebar, &QWidget::customContextMenuRequested, this, [this](const QPoint &point) {
+        sidebarMenu(sidebar->mapToGlobal(point), nullptr);
+    });
     sites->setAccessibleName(QStringLiteral("Сайты"));
+    sites->setHeaderHidden(true);
+    sites->setIndentation(18);
+    sites->setAnimated(false);
+    sites->setExpandsOnDoubleClick(false);
+    sites->setUniformRowHeights(true);
     sites->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     navigation->addWidget(sites, 1);
     shell->addWidget(sidebar);
@@ -223,11 +282,20 @@ MainWindow::MainWindow(const QString &path)
     footer->addWidget(idleLabel);
     vault->addLayout(footer);
     shell->addWidget(content, 1);
-    connect(sites, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *item) {
-        selectedSite = item ? item->data(Qt::UserRole).toUuid() : QUuid{};
+    connect(sites, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem *item) {
+        const bool group = item && item->data(0, groupRole).toBool();
+        selectedSite = item && !group ? item->data(0, Qt::UserRole).toUuid() : QUuid{};
+        selectedGroup = group ? item->data(0, Qt::UserRole).toUuid()
+            : item && item->parent() ? item->parent()->data(0, Qt::UserRole).toUuid() : QUuid{};
         renderSite();
     });
     connect(search, &QLineEdit::textChanged, this, [this] { refresh(); });
+    connect(sites, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
+        expandedGroups.insert(item->data(0, Qt::UserRole).toUuid());
+    });
+    connect(sites, &QTreeWidget::itemCollapsed, this, [this](QTreeWidgetItem *item) {
+        expandedGroups.remove(item->data(0, Qt::UserRole).toUuid());
+    });
     pages->addWidget(vaultPage);
 
     idleTimer.setInterval(500);
@@ -299,6 +367,8 @@ void MainWindow::lock()
 {
     idleTimer.stop();
     selectedSite = QUuid{};
+    selectedGroup = QUuid{};
+    expandedGroups.clear();
     {
         const QSignalBlocker blockSites(sites);
         const QSignalBlocker blockSearch(search);
@@ -337,18 +407,116 @@ void MainWindow::refresh(const QUuid &siteId)
     const QSignalBlocker blocker(sites);
     sites->clear();
     const auto globe = actionIcon("globe2");
-    QListWidgetItem *active = nullptr;
+    QHash<QUuid, QTreeWidgetItem *> groupItems;
+    QList<QTreeWidgetItem *> roots;
+    for (const auto &group : manager.data().groups) {
+        auto *item = new QTreeWidgetItem;
+        item->setText(0, group.name);
+        item->setIcon(0, siteIcon(group.iconName));
+        item->setData(0, Qt::UserRole, group.id);
+        item->setData(0, groupRole, true);
+        item->setChildIndicatorPolicy(QTreeWidgetItem::ShowIndicator);
+        groupItems.insert(group.id, item);
+        roots.append(item);
+    }
+    QTreeWidgetItem *active = nullptr;
     for (const auto *site : matching) {
-        auto *item = new QListWidgetItem(globe, site->name, sites);
-        item->setData(Qt::UserRole, site->id);
+        const auto icon = siteIcon(site->iconName);
+        auto *item = new QTreeWidgetItem;
+        item->setText(0, site->name);
+        item->setIcon(0, icon.isNull() ? globe : icon);
+        item->setData(0, Qt::UserRole, site->id);
+        if (auto *parent = groupItems.value(site->groupId))
+            parent->addChild(item);
+        else
+            roots.append(item);
         if (site->id == selectedSite)
             active = item;
     }
-    if (!active && sites->count() > 0)
-        active = sites->item(0);
+    for (auto it = roots.begin(); it != roots.end();) {
+        auto *item = *it;
+        if (item->data(0, groupRole).toBool() && item->childCount() == 0 && !filter.isEmpty()) {
+            delete item;
+            it = roots.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    std::sort(roots.begin(), roots.end(), [&](const QTreeWidgetItem *left, const QTreeWidgetItem *right) {
+        return collator.compare(left->text(0), right->text(0)) < 0;
+    });
+    sites->addTopLevelItems(roots);
+    for (auto *item : roots) {
+        if (!item->data(0, groupRole).toBool())
+            continue;
+        const auto id = item->data(0, Qt::UserRole).toUuid();
+        item->setExpanded(expandedGroups.contains(id) || !filter.isEmpty());
+        if (!active && id == selectedGroup)
+            active = item;
+    }
+    if (!active && !roots.isEmpty())
+        active = roots.front();
+    if (active && active->parent() && (!siteId.isNull() || !filter.isEmpty())) {
+        active->parent()->setExpanded(true);
+        expandedGroups.insert(active->parent()->data(0, Qt::UserRole).toUuid());
+    }
     sites->setCurrentItem(active);
-    selectedSite = active ? active->data(Qt::UserRole).toUuid() : QUuid{};
+    const bool group = active && active->data(0, groupRole).toBool();
+    selectedSite = active && !group ? active->data(0, Qt::UserRole).toUuid() : QUuid{};
+    selectedGroup = group ? active->data(0, Qt::UserRole).toUuid()
+        : active && active->parent() ? active->parent()->data(0, Qt::UserRole).toUuid() : QUuid{};
     renderSite();
+}
+
+void MainWindow::createSiteInGroup(const QUuid &groupId)
+{
+    if (!manager.unlocked())
+        return;
+    const auto previousSite = selectedSite;
+    const auto previousGroup = selectedGroup;
+    selectedSite = QUuid{};
+    selectedGroup = groupId;
+    siteDialog();
+    if (manager.unlocked() && selectedSite.isNull()) {
+        selectedSite = previousSite;
+        selectedGroup = previousGroup;
+    }
+}
+
+void MainWindow::sidebarMenu(const QPoint &position, QTreeWidgetItem *item)
+{
+    if (!manager.unlocked())
+        return;
+    sites->setCurrentItem(item);
+    QMenu menu(this);
+    menu.setWindowFlag(Qt::FramelessWindowHint);
+    menu.setAttribute(Qt::WA_TranslucentBackground);
+    const auto add = [&](const QString &text, const char *icon, const std::function<void()> &action) {
+        auto *entry = menu.addAction(actionIcon(icon), text);
+        connect(entry, &QAction::triggered, this, [this, action] {
+            if (manager.unlocked())
+                action();
+        });
+    };
+    const bool group = item && item->data(0, groupRole).toBool();
+    const auto groupId = group ? item->data(0, Qt::UserRole).toUuid()
+        : item && item->parent() ? item->parent()->data(0, Qt::UserRole).toUuid() : QUuid{};
+    add(QStringLiteral("Добавить сайт"), "plus-lg", [this, groupId] { createSiteInGroup(groupId); });
+    if (!item) {
+        add(QStringLiteral("Создать группу"), "plus-lg", [this] { groupDialog(); });
+    } else if (group) {
+        menu.addSeparator();
+        add(QStringLiteral("Изменить группу"), "pencil", [this] { groupDialog(true); });
+        add(QStringLiteral("Удалить группу"), "trash", [this] { removeGroup(); });
+    } else {
+        menu.addSeparator();
+        add(QStringLiteral("Изменить сайт"), "pencil", [this] {
+            if (const auto *site = currentSite())
+                siteDialog(site);
+        });
+        add(QStringLiteral("Удалить сайт"), "trash", [this] { removeSite(); });
+    }
+    menu.exec(position);
 }
 
 const Site *MainWindow::currentSite() const
@@ -390,6 +558,60 @@ void MainWindow::renderSite()
     cards->setWidget(body);
 
     if (!site) {
+        if (!selectedGroup.isNull()) {
+            for (const auto &group : manager.data().groups) {
+                if (group.id == selectedGroup) {
+                    siteTitle->setText(group.name);
+                    siteAddress->clear();
+                    std::vector<const Site *> groupedSites;
+                    for (const auto &item : manager.data().sites) {
+                        if (item.groupId == group.id)
+                            groupedSites.push_back(&item);
+                    }
+                    QCollator order(QLocale(QLocale::Russian, QLocale::Russia));
+                    order.setCaseSensitivity(Qt::CaseInsensitive);
+                    std::sort(groupedSites.begin(), groupedSites.end(), [&](const Site *left, const Site *right) {
+                        return order.compare(left->name, right->name) < 0;
+                    });
+                    for (const auto *item : groupedSites) {
+                        auto *card = new QPushButton(body);
+                        card->setObjectName(QStringLiteral("siteCard"));
+                        card->setAccessibleName(QStringLiteral("Открыть сайт %1").arg(item->name));
+                        card->setCursor(Qt::PointingHandCursor);
+                        card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+                        auto *row = new QHBoxLayout(card);
+                        row->setContentsMargins(16, 14, 16, 14);
+                        row->setSpacing(12);
+                        auto *icon = new QLabel(card);
+                        const auto chosen = siteIcon(item->iconName);
+                        icon->setPixmap((chosen.isNull() ? actionIcon("globe2") : chosen).pixmap(24, 24));
+                        row->addWidget(icon);
+                        auto *text = new QVBoxLayout;
+                        text->setSpacing(4);
+                        text->addWidget(label(item->name, card, "cardTitle"));
+                        text->addWidget(label(item->url, card));
+                        row->addLayout(text, 1);
+                        auto *arrow = new QLabel(card);
+                        arrow->setPixmap(actionIcon("box-arrow-up-right").pixmap(18, 18));
+                        row->addWidget(arrow);
+                        for (auto *part : card->findChildren<QLabel *>())
+                            part->setAttribute(Qt::WA_TransparentForMouseEvents);
+                        const auto id = item->id;
+                        connect(card, &QPushButton::clicked, this, [this, id] {
+                            const QSignalBlocker block(search);
+                            clearText(search);
+                            refresh(id);
+                        });
+                        list->addWidget(card);
+                    }
+                    if (groupedSites.empty())
+                        list->addWidget(label(QStringLiteral("В этой группе пока нет сайтов."), body));
+                    list->addStretch();
+                    status->setText(QStringLiteral("Сайтов: %1").arg(groupedSites.size()));
+                    return;
+                }
+            }
+        }
         const bool filtered = !search->text().trimmed().isEmpty();
         siteTitle->setText(filtered ? QStringLiteral("Сайты не найдены") : QStringLiteral("Хранилище"));
         siteAddress->setText(filtered ? QStringLiteral("Попробуйте другое название.")
@@ -427,16 +649,19 @@ void MainWindow::renderSite()
             if (const auto *item = account(id))
                 copy(item->login);
         });
-        iconButton(row, card, QStringLiteral("Копировать пароль"), "key", [this, id] {
+        auto *copyPassword = iconButton(row, card, QStringLiteral("Копировать пароль"), "key", [this, id] {
             if (const auto *item = account(id))
                 copy(item->password);
         });
+        copyPassword->setEnabled(!entry.password.isEmpty());
         iconButton(row, card, QStringLiteral("Изменить аккаунт"), "pencil", [this, id] {
             if (const auto *item = account(id))
                 entryDialog(item);
         });
         iconButton(row, card, QStringLiteral("Удалить аккаунт"), "trash", [this, id] { removeEntry(id); });
         layout->addLayout(row);
+        if (entry.alternativeSignIn)
+            layout->addWidget(label(QStringLiteral("Вход: %1").arg(entry.signInMethod), card));
         if (!entry.emails.empty()) {
             QString summary = entry.emails.front().address;
             if (entry.emails.size() > 1)

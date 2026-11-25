@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(LocalVault VERSION 2.1.0 LANGUAGES CXX)
+project(LocalVault VERSION 3.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,8 +23,10 @@ add_library(vault_core STATIC src/Vault.cpp)
 target_include_directories(vault_core PUBLIC src)
 target_link_libraries(vault_core PUBLIC Qt6::Core Sodium::Sodium PRIVATE OpenSSL::Crypto)
 
-add_library(vault_widgets STATIC src/MainWindow.cpp src/VaultActions.cpp src/Dialogs.cpp)
+add_library(vault_widgets STATIC src/MainWindow.cpp src/VaultActions.cpp src/Dialogs.cpp src/IconPicker.cpp)
 target_link_libraries(vault_widgets PUBLIC vault_core Qt6::Widgets PRIVATE Qt6::Svg)
+file(GLOB SITE_ICONS CONFIGURE_DEPENDS "assets/site-icons/*.svg")
+qt_add_resources(vault_widgets site_icons PREFIX "/site-icons" BASE "assets/site-icons" FILES ${SITE_ICONS})
 qt_add_resources(vault_widgets bootstrap_icons PREFIX "/actions" BASE "assets/bootstrap" FILES
     assets/bootstrap/plus-lg.svg assets/bootstrap/dash-lg.svg assets/bootstrap/trash.svg
     assets/bootstrap/pencil.svg assets/bootstrap/eye.svg assets/bootstrap/eye-slash.svg
